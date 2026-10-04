@@ -122,3 +122,7 @@ See [`AGENTS.md`](AGENTS.md) for the non-negotiables.
 | `--lock PATH` | lock file location |
 
 `ffmpeg`/`ffprobe` are taken from `PATH`, or from `TRANSCODE_FFMPEG` / `TRANSCODE_FFPROBE`.
+
+## License
+
+[MIT](LICENSE) © 2026 Lee Teong Hoe (Hoelee Enterprise)

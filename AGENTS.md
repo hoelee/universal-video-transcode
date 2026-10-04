@@ -43,6 +43,7 @@ There are **no credentials** in this project, so there is no `SECRETS.md`.
 ```
 SKILL.md                                   the Hermes skill (installed per §4)
 README.md                                  human-facing overview
+docs/WHY.md                                the benefit case: ten real failures + the guard each produced
 scripts/transcode.py                       the tool: plan -> encode -> verify -> keep input on failure
 scripts/selftest.py                        proves the detector; both defect shapes, no false positives
 references/compatibility-matrix.md         per-platform codec/container facts with citations

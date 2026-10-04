@@ -51,6 +51,11 @@ flat_noctts.mp4                    True     True     ok    MP4 with NO ctts box
 flat_ctts1.mp4                     True     True     ok    MP4 with a single constant ctts entry
 ```
 
+**Measured on the file that prompted this:** 23.0% of frames dropped before, **0.0% after**.
+
+The full benefit case — the ten real failures this pipeline hit and the guard each one
+produced — is in [`docs/WHY.md`](docs/WHY.md).
+
 ## Compatibility
 
 | | iPad / iOS | Android |

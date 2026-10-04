@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+*.part.mp4
+.transcode.lock

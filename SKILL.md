@@ -23,6 +23,25 @@ python scripts/transcode.py "D:/video" --recursive --dry-run   # plan only
 python scripts/transcode.py "D:/video" --out D:/converted
 ```
 
+## Scope — read this before applying the size policy
+
+This policy is for **H.264 (and older MPEG-4/DivX) sources**, where the source is fat enough that
+HEVC at matched quality lands 25-50% smaller (the course-library case: 1080p H.264 at
+550-2400 kbps, mp3 audio, files 300 MB-1.3 GB).
+
+**Do NOT run the size hunt on YouTube-sourced libraries (VP9/AV1).** YouTube already serves those
+at a near-optimal bitrate for their quality, so re-encoding an already-lean VP9/AV1 file can only
+grow it or lose quality - "the source is already as small as it gets, and that is accepted". The
+job there is narrower and different:
+
+| | H.264 library (this policy) | YouTube VP9/AV1 library |
+|---|---|---|
+| goal | same look, **smaller** file | same look, same size - no shrink sought |
+| decode | any correct decoder | **never `*_cuvid`** (wrong frames, see below) |
+| quality gate | SSIM >= 0.996 + size ceiling | **per-frame content check vs the software decode** |
+| source for a repair | the file itself | **the pre-conversion snapshot backup**, never the already-converted file |
+| frame cadence | `-fps_mode cfr` | `-fps_mode cfr` |
+
 ## What "playable everywhere" actually means
 
 The intersection that both platforms decode **without a third-party player**:
@@ -142,6 +161,99 @@ python /path/to/scripts/transcode.py "Z:/docker/tubesync/download" --recursive \
 For a TubeSync library specifically, prefer its own DB-driven pipeline (`tubesync-selfhosted`)
 — it also updates the database rows. Use this tool for anything outside that library.
 
+## Whole-library runs on a network share (in-place, safe)
+
+`transcode.py` writes `dst + ".part.mp4"` **next to the source**. Over SMB/WebDAV/Dokan that
+is the failure mode to avoid, and when the source is already `.mp4` then `dst == src`, so the
+only copy of the file is the one being written. For a library run, drive ffmpeg directly
+from a small runner instead:
+
+1. copy the source **off the share** to local disk (chunked; treat a short read as failure)
+2. encode locally, with the same mandatory flags (`-fps_mode cfr`, `-pix_fmt yuv420p`)
+3. run the structural gate **and** a full decode pass on the local output
+4. upload to `<name>.new.mp4` (never the final name)
+5. read the share copy back end-to-end and compare **SHA-256 + byte count** with the local file
+6. only then `os.replace()` it over the original, and re-probe the result on the share
+
+Step 5 costs one extra network read (~1 h per 330 GiB) and is the only thing that actually
+proves the remote copy is complete — `getsize()` cannot, and neither can a duration probe:
+with `+faststart` the `moov` is written first, so a truncated file still reports full duration.
+Keep a JSONL ledger and a per-file skip test ("already HEVC hvc1") so a reboot resumes safely.
+A single instance only; the lock matters even more here because two runs would race on `dst`.
+
+### `plan_for()` gaps to know before a library run
+
+- **`mpeg4` (DivX/Xvid) returns `None` = "unsupported video codec"** — it is skipped, not
+  converted, so `.avi`/`mp4v` files silently keep a codec no iPad can play. Give them an
+  explicit re-encode.
+- **Repairing a defective H.264 timeline returns `x264`, not HEVC** (hardcoded in the H.264
+  branch). If the requirement is "everything in HEVC", force it — the recipe is a policy, not
+  the tool's default.
+- A truncated file (`moov atom not found`) is a **re-download**, not a transcode job; report it
+  instead of retrying.
+
+### Measured throughput (RTX 3060, hevc_nvenc p6, `-tune hq`, cq 27)
+
+Use these to quote an ETA before starting — the estimate is the user's decision input.
+
+| source | speed |
+|---|---|
+| 1080p25 H.264 | **6.4x realtime** (~160 fps) |
+| 480x270 | ~34x realtime |
+| per-file overhead | ~45 s (local copy + decode pass + upload + read-back hash) |
+
+A 520 h / 324 GiB library is therefore ~73 h of wall clock, not the ~40 h a bitrate-based
+guess suggests. Encode order is a real choice: newest-first finishes the currently-watched
+content in hours instead of days.
+
+## "Same quality" is not the same cq number (measured)
+
+`hevc_nvenc -cq 27` and `libx265 -crf 27` are **not the same quality**. Same number,
+different scale: on one 1080p25 source (source video 1.20 Mbps), 8-minute window, video only:
+
+| setting | Mbps | % of source video | SSIM |
+|---|---|---|---|
+| source H.264 (x264 2-pass) | 1.20 | 100% | ref |
+| hevc_nvenc cq27 | 1.31 | **109%** | 0.9971 |
+| hevc_nvenc cq30 | 0.91 | 76% | 0.9963 |
+| libx265 crf24 | 0.83 | 69.5% | 0.9963 |
+| hevc_nvenc cq32 | 0.69 | 58% | 0.9955 |
+| libx265 crf27 | 0.58 | 48% | 0.9952 |
+| hevc_nvenc cq34 | 0.54 | 45% | 0.9947 |
+
+**Compare only at matched SSIM, never at matched cq/crf numbers.** Matched pairs here:
+NVENC cq30 vs x265 crf24 (both 0.9963) -> x265 9% smaller; NVENC cq32 vs x265 crf27
+(0.9955/0.9952) -> x265 16% smaller. So software is **9-16% more bit-efficient at equal
+quality**, not the 2-2.5x that a raw cq27-vs-crf27 comparison implies - most of that gap is a
+quality difference. Price: ~3x realtime (x265 fast, 1080p) vs 6.4x (NVENC).
+
+**Why a library can grow instead of shrink.** On sources that are already efficiently
+encoded H.264, NVENC cq27 is a *higher* quality target than the source itself, so the video
+comes back at ~109% and the file grows. Quality must be pinned to a number, e.g. "SSIM >= 0.996
+against the source", which is the only self-consistent definition when the source is already
+lossy and no master exists to measure against. SSIM >= 0.996 lands the video near 70% of the
+source bitrate - that is where the actual saving lives.
+
+**Classify the source before choosing a setting.** bpp = bitrate / (w * h * fps) measures how
+much fat is left, and it is readable in milliseconds:
+
+| bpp | meaning |
+|---|---|
+| < 0.015 | already soft - re-encoding gains almost nothing, prefer `-c copy` |
+| 0.015-0.025 | lean (typical streaming) |
+| 0.025-0.040 | normal |
+| > 0.040 | real headroom - worth a real re-encode |
+
+One library measured 131 files < 0.025 against 243 files > 0.040 out of 572 - a single global
+cq cannot be right for both. Calibrate per class (1-2 representatives, 60-120 s sample, sweep 2-3
+cq values, keep the cheapest that hits the SSIM target); per-file calibration costs 1-2 min each.
+A `-maxrate` of 1.0x the source bitrate is a cheap hard guarantee that output never grows.
+
+**Audio must match the source, not a fixed 256k.** A weekly series shipping mp3 at 128 kbps was
+re-encoded to `-b:a 256k`: that added ~128 kbps for no audible gain, ~+10% file size on a
+1.3 Mbps file - enough to cancel the video saving on its own. AAC is more efficient than mp3, so
+`-b:a` = the source's own audio bitrate (clamped, e.g. 96-256k) is already a quality upgrade.
+
 ## Pitfalls
 
 - **Never write the encode output directly to a network share.** A streaming `.part` write over
@@ -163,6 +275,25 @@ For a TubeSync library specifically, prefer its own DB-driven pipeline (`tubesyn
   bash cannot hand a Chinese filename to native `ffmpeg.exe` even when `ls` shows it.
 - **`-hwaccel cuda` alone may still software-decode VP9**; `-c:v vp9_cuvid` forces NVDEC.
 
+## The owner's standing requirements — read this first
+
+When the ask is "convert this library to HEVC, same look, same sound, playable on iPad+Android,
+never bigger, no judder", the defaults here are **not** enough: a fixed `-cq 27` targets a quality
+*above* an already-efficient H.264 source, so the library grows instead of shrinking.
+
+| requirement | the answer |
+|---|---|
+| never bigger than the source | `-maxrate` = 1.0x the source **video** bitrate + a post-encode size assertion |
+| same picture quality | pin it to a number: **SSIM >= 0.996** vs the source (video lands near 70% of the source bitrate) |
+| same sound quality | copy AAC; for mp3/opus, AAC at **the source's own bitrate**, never a fixed 256k |
+| iPad + Android | MP4 + `hvc1` + `yuv420p` + AAC |
+| no judder | `-fps_mode cfr` on every re-encode, the three cadence defects gated, and **no `*_cuvid` decoders** |
+| verification | mandatory, and it must assert on the output, not on the input |
+| CPU encoding | allowed, but **tell the owner first** and quote the wall clock (~3x realtime vs 6.4x) |
+
+Full policy, including the measured numbers, the source-classification table, the judder detector
+table and every CPU/threading knob: **`references/hevc-conversion-policy.md`**.
+
 ## Support files
 
 - `scripts/transcode.py` — the tool. `--dry-run`, `--codec`, `--cq/--crf`, `--audio`,
@@ -171,3 +302,6 @@ For a TubeSync library specifically, prefer its own DB-driven pipeline (`tubesyn
   the HEVC level caveat, and what breaks on each device.
 - `references/verification-and-automation.md` — the defect classes, the structural gate, the
   browser arbiter and its blind spot, and the 2x2 causality proof.
+- `references/hevc-conversion-policy.md` — the owner's standing requirements for a HEVC library job
+  (size ceiling, SSIM-pinned quality, bpp classification, audio matched to the source, the three
+  judder classes, the mandatory verification chain, and the CPU/throttling knobs, efficiency first).

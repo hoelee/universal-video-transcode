@@ -300,6 +300,13 @@ table and every CPU/threading knob: **`references/hevc-conversion-policy.md`**.
 
 ## Support files
 
+- `scripts/library_run.py` — the whole-library driver that enforces the policy above: bpp tiering
+  (copy / nvenc / x265), `-maxrate` at 1.0x the source **video** bitrate + a size assertion, a
+  per-frame SSIM gate with a one-step quality retry, audio matched to the source, local staging,
+  SHA-256 read-back before an atomic replace, a JSONL ledger, a run lock, E-core pinning for the
+  CPU tier, `--tier` to run tiers separately, `--dry-run` for the classification plan,
+  `--keep-local` to pilot without touching anything, and `--origin-root` to redo files that an
+  earlier bad setting bloated, sourcing them from a snapshot of the originals (never deleting it).
 - `scripts/transcode.py` — the tool. `--dry-run`, `--codec`, `--cq/--crf`, `--audio`,
   `--channels`, `--cpu`, `--keep`, `--overwrite`, `--no-decode-check`, `--lock`.
 - `references/compatibility-matrix.md` — per-platform codec/container facts with citations,

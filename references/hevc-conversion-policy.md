@@ -256,6 +256,31 @@ Defaults that follow from this, and the gates that enforce them, are in `scripts
 video bitrate may not exceed the source's), a one-step quality retry when the SSIM gate fails, and
 `-maxrate` = 1.0x the source's **video** bitrate.
 
+## 12. Re-doing files the old settings bloated (use the ORIGINAL, not the converted file)
+
+When a library was already converted with the wrong settings, the output is **bigger than the
+original** and re-encoding it again would be a second-generation loss. The fix is to redo it from
+the **pre-conversion original**, which usually still exists in a dated snapshot of the library
+(measured: a 2026-09-25 snapshot held all 582 files / 324 GiB of the course library).
+
+Measured audit of such a set (54 files converted at `-cq 27` + a fixed 256k audio):
+
+| by the ORIGINAL's bpp | files | live/original | what they needed |
+|---|---|---|---|
+| copy (<0.025) | **25** | up to **124.8%** | no video re-encode at all - the video should have been copied |
+| nvenc (0.025-0.040) | 26 | 106-122% | cq 31 instead of 27 |
+| x265 (>0.040) | 3 | - | crf 26 |
+
+`scripts/library_run.py --origin-root <snapshot-tree>` implements this safely:
+
+* a file whose live copy is already HEVC is re-done **only if it is bigger than its original**
+  (`> 1.01x`); otherwise it is skipped - so the run is idempotent without any extra bookkeeping;
+* the encode reads the **original**, the tier is classified from the **original's** bpp, and the
+  gates compare against the **original** - the converted file is never used as a reference;
+* `dst` stays the live path, so the output replaces the (bloated) converted file;
+* **the original is never modified or deleted** - `os.remove(src)` is suppressed whenever the
+  source came from the origin tree. Getting this backwards would destroy the only clean copy.
+
 ## 9. CPU and GPU tiers in parallel
 
 Different tiers can encode **at the same time** — NVENC is a fixed-function ASIC, x265 is CPU.

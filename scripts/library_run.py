@@ -338,16 +338,31 @@ def already_hevc(src, info):
     return True
 
 
-def process(src, args):
+def process(src, args, dest=None, origin=None):
     info = T.probe(src)
     if not info:
         return "FAIL unreadable", None
     if info["dur"] < 1.0:
         return "FAIL stub (%.1fs) - needs a re-download, not a transcode" % info["dur"], None
-    dst = dst_path_for(src)
+    live = dest or dst_path_for(src)
+
     if info["vcodec"] == "hevc" and info["tag"] == "hvc1" and info["pix"] in ("yuv420p",) \
             and not T.unusable_timeline(info, src)[0]:
-        return "SKIP already HEVC hvc1", None
+        # Already converted. Only worth touching if the ORIGINAL is available and the current
+        # file is BIGGER than it: that is precisely the old settings' damage (a fixed cq27 above
+        # the source's own quality plus a fixed 256k audio). A file that is already smaller than
+        # its original is left alone, which makes the whole run naturally idempotent.
+        if not (origin and os.path.exists(origin)):
+            return "SKIP already HEVC hvc1", None
+        o_size = os.path.getsize(origin)
+        if info["size"] <= o_size * 0.99:
+            return "SKIP already HEVC hvc1 (%.0f MB <= original %.0f MB)" % (
+                info["size"] / 1e6, o_size / 1e6), None
+        log("   re-doing from the original: live %.0f MB > original %.0f MB" % (
+            info["size"] / 1e6, o_size / 1e6))
+        src, info = origin, T.probe(origin)
+        if not info:
+            return "FAIL original unreadable", None
 
     # ---- policy: classify the source, then work only on the requested tier (if any) ----------
     vbps = src_video_bps(src, info)
@@ -363,10 +378,11 @@ def process(src, args):
     tag = hashlib.sha1(src.encode("utf-8")).hexdigest()[:12]
     loc_src = os.path.join(STAGE, tag + "_src" + os.path.splitext(src)[1].lower())
     loc_out = os.path.join(STAGE, tag + "_out.mp4")
-    remote_tmp = dst + ".new.mp4"
+    remote_tmp = live + ".new.mp4"
     for p in (loc_src, loc_out):
         if os.path.exists(p):
             os.remove(p)
+    origin_used = bool(origin and os.path.abspath(src) == os.path.abspath(origin))
     try:
         if os.path.exists(remote_tmp):
             os.remove(remote_tmp)
@@ -433,16 +449,18 @@ def process(src, args):
                 pass
             return "FAIL read-back mismatch local=%s/%d remote=%s/%d" % (h_loc[:12], n_loc, h_rem[:12], n_rem), None
         # 6. atomic replace, then confirm on the share
-        os.replace(remote_tmp, dst)
-        if os.path.abspath(dst) != os.path.abspath(src):
+        os.replace(remote_tmp, live)
+        # NEVER delete the source when it came from the snapshot origin: that is the archive of
+        # the originals, and removing it would destroy the only clean copy of the library.
+        if not origin_used and os.path.abspath(live) != os.path.abspath(src):
             os.remove(src)
-        back = T.probe(dst)
+        back = T.probe(live)
         tag_needed = (tier != "copy")
         if not back or back["vcodec"] != expect_vc \
                 or (tag_needed and back["tag"] != "hvc1") \
                 or abs(back["dur"] - info["dur"]) > max(1.0, info["dur"] * 0.01):
             return "FAIL read-back probe: %s" % (back and (back["vcodec"], back["tag"], back["dur"]),), None
-        ok, msg = probe_ok(dst, info, expect_vc)
+        ok, msg = probe_ok(live, info, expect_vc)
         if not ok:
             return "FAIL post-replace gate on share: %s" % msg, None
         return "ok", {"sha256": h_loc, "bytes": n_loc, "src_bytes": n_in,
@@ -479,6 +497,10 @@ def main():
     ap.add_argument("--pools", type=int, default=X265_POOLS, help="x265 threads (match the E-core mask)")
     ap.add_argument("--tier", choices=["copy", "nvenc", "x265"],
                     help="only touch files classified into this tier (run tiers separately)")
+    ap.add_argument("--origin-root", default=None,
+                    help="tree holding the PRE-CONVERSION originals (e.g. a snapshot); a file that "
+                         "is already HEVC and BIGGER than its original is re-done from that "
+                         "original, and the original is never modified or deleted")
     ap.add_argument("--audio", default=None,
                     help="audio bitrate; default = the SOURCE's own bitrate (never a fixed 256k)")
     ap.add_argument("--nvenc-preset", default=NVENC_PRESET)
@@ -535,8 +557,12 @@ def main():
                 break
             log("--- %d/%d %s" % (i, len(files), os.path.relpath(f, ROOT)))
             t0 = time.time()
+            origin = None
+            if args.origin_root:
+                cand = os.path.join(args.origin_root, os.path.relpath(f, ROOT))
+                origin = cand if os.path.exists(cand) else None
             try:
-                status, extra = process(f, args)
+                status, extra = process(f, args, dest=dst_path_for(f), origin=origin)
             except Exception as e:
                 status, extra = "FAIL %s: %s" % (type(e).__name__, e), None
             el = time.time() - t0
@@ -564,4 +590,5 @@ def main():
             sys.exit(1)
 
 
-main()
+if __name__ == "__main__":
+    main()

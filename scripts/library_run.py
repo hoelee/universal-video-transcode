@@ -110,14 +110,21 @@ def _sha_remote(path, label="remote", tries=3):
     raise last
 
 
-def copy_remote_to_local(remote, local, expect_size=None, tries=3):
-    """Network -> local. Retried; a short read is a failure, never a silent pass."""
+def copy_remote_to_local(remote, local, expect_size=None, tries=5):
+    """Network -> local. Retried; a short read is a failure, never a silent pass.
+
+    Measured on this host: RaiDrive/Dokan throws `[Errno 9] Bad file descriptor` on a 1 GB read
+    when three jobs hammer the share at once (the user sees RaiDrive's own upload-failure toasts at
+    the same time). Smaller chunks, more attempts and a longer backoff ride those hiccups out
+    instead of losing the file - and each failed attempt costs minutes on a 1 GB source, so the
+    point is to stop retrying as fast as we can.
+    """
     for attempt in range(1, tries + 1):
         try:
             n = 0
             with open(remote, "rb") as fi, open(local, "wb") as fo:
                 while True:
-                    b = fi.read(8 << 20)
+                    b = fi.read(4 << 20)
                     if not b:
                         break
                     fo.write(b)
@@ -128,31 +135,46 @@ def copy_remote_to_local(remote, local, expect_size=None, tries=3):
                 raise IOError("short read: got %d, container says %d" % (n, expect_size))
             return n
         except OSError as e:
-            log("   ! source copy attempt %d failed: %s" % (attempt, e))
-            time.sleep(5 * attempt)
+            log("   ! source copy attempt %d/%d failed: %s" % (attempt, tries, e))
+            time.sleep(15 * attempt)
     raise IOError("could not copy source off the share after %d attempts" % tries)
 
 
-def copy_local_to_remote(local, remote_tmp, tries=3):
-    """Local -> network temp name. Chunked; never writes the final name."""
+def copy_local_to_remote(local, remote_tmp, tries=4):
+    """Local -> network temp name. Chunked; never writes the final name.
+
+    Measured failure mode on this host: RaiDrive/Dokan aborts a ~500 MB write with
+    "the operation didn't complete within specific time limit" (and leaves a partial `.new.mp4`),
+    which the user sees as an upload-failed toast. Three jobs reading/writing the share at once is
+    what provokes it. So: smaller chunks, a periodic flush so nothing huge sits in a buffer, more
+    attempts, and a longer backoff. A partial file is always deleted before retrying (never resumed
+    from `os.path.getsize()` on the share - RaiDrive reports stale sizes, so an offset taken from it
+    would silently corrupt the upload).
+    """
     for attempt in range(1, tries + 1):
         try:
+            written = 0
             with open(local, "rb") as fi, open(remote_tmp, "wb") as fo:
                 while True:
-                    b = fi.read(8 << 20)
+                    b = fi.read(4 << 20)
                     if not b:
                         break
                     fo.write(b)
+                    written += len(b)
+                    if written % (32 << 20) < (4 << 20):
+                        fo.flush()
+                        os.fsync(fo.fileno())
                 fo.flush()
                 os.fsync(fo.fileno())
             return True
         except OSError as e:
-            log("   ! upload attempt %d failed: %s" % (attempt, e))
+            log("   ! upload attempt %d/%d failed after %.0f MB: %s" % (
+                attempt, tries, written / 1e6, e))
             try:
                 os.remove(remote_tmp)
             except OSError:
                 pass
-            time.sleep(5 * attempt)
+            time.sleep(20 * attempt)
     return False
 
 
@@ -238,17 +260,48 @@ def ssim_vs_source(src_local, out_local, info, workdir, tag, dur=SSIM_WINDOW):
     decode stays cheap). NB the stats file must be a BARE name inside workdir - a Windows path
     inside `-lavfi` has its backslashes eaten by the filter parser, which silently yields zero
     frames and 0.0000 SSIM.
+
+    Both sides are decoded with `-fps_mode passthrough` so the frame counts are the REAL ones. If
+    they differ by more than 1% the source's timeline is irregular (measured on this library: a
+    source with a 1.7 s hole - 1459 frames where 1500 belong - while the CFR encode fills it with
+    duplicated frames), and a frame-by-frame comparison is *meaningless*: after the hole every
+    frame pairs with the wrong one and SSIM collapses to 0.25 while the encode is perfectly good.
+    In that case the picture gate is skipped (reported, not silently) and the caller's other
+    assertions - structure, full decode, frame count not lower than the source, size ceiling -
+    carry the verdict.
     """
     start = max(0.0, (info["dur"] / 2) - dur / 2)
     cmp_scale = "480:270"
     ref = os.path.join(workdir, "ssim_ref.yuv")
     out = os.path.join(workdir, "ssim_out.yuv")
+    counts = []
+    # Seek a little BEFORE the window and cut it with the trim filter on ABSOLUTE timestamps
+    # (`-copyts`): an input seek snaps to a keyframe, and it snapped to a *different* keyframe for
+    # the source and the encode (measured: two 1500-frame decodes whose start times differed by
+    # ~10 s -> SSIM mean 0.45 on a perfectly good encode). Trimming on PTS makes both sides cover
+    # exactly the same interval no matter where the seek landed.
+    seek = max(0.0, start - 20.0)
+    vf = ("trim=start=%.3f:end=%.3f,setpts=PTS-STARTPTS,scale=%s:flags=bilinear,format=yuv420p"
+          % (start, start + dur, cmp_scale))
     for path, dstp in ((src_local, ref), (out_local, out)):
-        r = run([FFMPEG, "-y", "-v", "error", "-ss", "%.2f" % start, "-t", "%.2f" % dur, "-i", path,
-                 "-map", "0:v:0", "-an", "-vf", "scale=%s:flags=bilinear,format=yuv420p" % cmp_scale,
-                 "-f", "rawvideo", dstp], timeout=3600)
+        r = run([FFMPEG, "-y", "-v", "error", "-copyts", "-ss", "%.2f" % seek,
+                 "-t", "%.2f" % (dur + 40), "-i", path,
+                 "-map", "0:v:0", "-an", "-vf", vf,
+                 "-fps_mode", "passthrough", "-f", "rawvideo", dstp], timeout=3600)
         if r.returncode != 0 or not os.path.exists(dstp) or not os.path.getsize(dstp):
-            return None, None, 0
+            return None, None, 0, None
+        counts.append(os.path.getsize(dstp) // (480 * 270 * 3 // 2))
+    n_src, n_out = counts
+    if n_src and abs(n_out - n_src) / float(n_src) > 0.01:
+        for f in (ref, out):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        return None, None, 0, ("source timeline irregular: %d frames vs %d in the sampled window "
+                               "(%.1f%% difference) - the CFR encode fills the source's holes, so a "
+                               "frame-by-frame comparison is not applicable" % (n_src, n_out,
+                                                                               100.0 * (n_out - n_src) / n_src))
     subprocess.run([FFMPEG, "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", cmp_scale,
                     "-i", ref, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", cmp_scale, "-i", out,
                     "-lavfi", "ssim=stats_file=ssim_%s.log" % tag, "-f", "null", "-"],
@@ -266,7 +319,9 @@ def ssim_vs_source(src_local, out_local, info, workdir, tag, dur=SSIM_WINDOW):
             os.remove(f)
         except OSError:
             pass
-    return (min(vals), sum(vals) / len(vals), len(vals)) if vals else (None, None, 0)
+    if vals:
+        return min(vals), sum(vals) / len(vals), len(vals), None
+    return None, None, 0, None
 
 
 def pin_to_e_cores():
@@ -410,11 +465,20 @@ def process(src, args, dest=None, origin=None):
             #     that the output video bitrate did not exceed the source's.
             ssim_note, growth = "copy (video bit-identical)", 100.0
             if tier != "copy":
-                lo, mean, nfr = ssim_vs_source(loc_src, loc_out, info, STAGE, tag)
-                if not nfr:
-                    return "FAIL ssim: no frames compared", None
+                lo, mean, nfr, irreg = ssim_vs_source(loc_src, loc_out, info, STAGE, tag)
                 obps = out_video_bps(loc_out, info["dur"])
                 growth = 100.0 * obps / vbps if vbps else 0.0
+                if irreg:
+                    # The source's timeline has holes, so frame pairing is meaningless; the encode
+                    # is still held to the structural/decode/size gates below. Report it loudly.
+                    ssim_note = "PICTURE GATE SKIPPED - %s" % irreg
+                    log("   !! %s" % ssim_note)
+                    if vbps and obps > vbps * SIZE_CEIL:
+                        return "FAIL size: output %.0f kbps > source %.0f kbps (%.1f%%)" % (
+                            obps / 1000, vbps / 1000, growth), None
+                    break
+                if not nfr:
+                    return "FAIL ssim: no frames compared", None
                 ssim_note = "ssim min %.4f mean %.4f (%d frames)%s" % (
                     lo, mean, nfr, "" if not q_off else " at quality+%d" % q_off)
                 if lo < SSIM_TARGET:
@@ -437,17 +501,31 @@ def process(src, args, dest=None, origin=None):
                           "ratio": round(100.0 * os.path.getsize(loc_out) / max(info["size"], 1), 1),
                           "tier": tier, "bpp": round(bpp, 4), "video_pct": round(growth, 1),
                           "ssim": ssim_note + " [LOCAL ONLY - not uploaded]", "encode_s": round(el, 1)}
-        if not copy_local_to_remote(loc_out, remote_tmp):
-            return "FAIL upload", None
-        # 5. read the share copy back and compare
+        # 4-5. upload under a temp name, then read the share copy back and compare.
+        # The read-back is not ceremony: RaiDrive can return from a write with NO error while the
+        # remote file is a fraction of the local one (measured: 12.5 MB of 403 MB), and its own
+        # "operation didn't complete within specific time limit" toast arrives afterwards. So a
+        # mismatch is retried rather than reported straight away.
         h_loc, n_loc = _sha_local(loc_out)
-        h_rem, n_rem = _sha_remote(remote_tmp)
-        if (h_loc, n_loc) != (h_rem, n_rem):
+        last = ""
+        for up in range(1, 3):
+            if not copy_local_to_remote(loc_out, remote_tmp):
+                last = "FAIL upload"
+                time.sleep(10 * up)
+                continue
+            h_rem, n_rem = _sha_remote(remote_tmp)
+            if (h_loc, n_loc) == (h_rem, n_rem):
+                break
+            last = "FAIL read-back mismatch local=%s/%d remote=%s/%d" % (
+                h_loc[:12], n_loc, h_rem[:12], n_rem)
+            log("   ! %s (upload %d) - retrying" % (last, up))
             try:
                 os.remove(remote_tmp)
             except OSError:
                 pass
-            return "FAIL read-back mismatch local=%s/%d remote=%s/%d" % (h_loc[:12], n_loc, h_rem[:12], n_rem), None
+            time.sleep(10 * up)
+        else:
+            return last, None
         # 6. atomic replace, then confirm on the share
         os.replace(remote_tmp, live)
         # NEVER delete the source when it came from the snapshot origin: that is the archive of
@@ -527,8 +605,13 @@ def main():
     if args.tier == "x265":
         # x265 is CPU: pin it to the E-cores so the P-cores stay free (children inherit the mask).
         log("=== E-core pinning: %s" % ("on" if pin_to_e_cores() else "FAILED (running unpinned)"))
-    log("=== %d file(s)  tier=%s cq=%d crf=%d audio=%s decode_check=%s" %
-        (len(files), args.tier or "auto", args.cq, args.crf, args.audio or "source-matched", DECODE_CHECK))
+    # One lock PER TIER, not one global lock: the copy tier uses no encoder, the x265 tier is CPU
+    # and the nvenc tier is the GPU ASIC, so they are safe to run side by side whereas two runs of
+    # the same tier would race on dst and starve a shared unit.
+    lockf = os.path.join(WORK, "run-%s.lock" % (args.tier or "all"))
+    log("=== %d file(s)  tier=%s cq=%d crf=%d audio=%s decode_check=%s lock=%s" %
+        (len(files), args.tier or "auto", args.cq, args.crf, args.audio or "source-matched",
+         DECODE_CHECK, os.path.basename(lockf)))
 
     if args.dry_run:
         plan = {}
@@ -547,7 +630,7 @@ def main():
         log("=== plan: %s" % plan)
         return
 
-    with T.Lock(LOCKF):
+    with T.Lock(lockf):
         stats = {"ok": 0, "skip": 0, "fail": 0}
         ledger = open(LEDGER, "a", encoding="utf-8")
         for i, f in enumerate(files, 1):

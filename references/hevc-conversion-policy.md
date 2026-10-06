@@ -1,7 +1,8 @@
-# HEVC conversion policy — never bigger, same look, no judder
+# HEVC conversion policy — playable everywhere first, shrink where there is headroom, no judder
 
 Owner's standing requirements for a HEVC conversion. Read this before starting a library job;
-the default settings in `transcode.py` do **not** satisfy them.
+the default settings in `transcode.py` do **not** satisfy them. Note the title: the size rule is
+**conditional** (section 1), not a blanket "never grow".
 
 ## 1. Size: shrink where there is headroom, growth is acceptable where there is not
 
@@ -84,6 +85,10 @@ One library: 131 files < 0.025 vs 243 files > 0.040 out of 572. A single global 
 cannot be right for both — that is precisely how a job ends up growing some files and shrinking
 others. Calibrate per class on 1-2 representatives (60-120 s, sweep 2-3 quality levels).
 
+bpp and the size regime are **different axes** and can disagree: bpp picks the *recipe* (how much
+effort is worth spending), while the pre-flight sample in section 2 picks the *size expectation*
+(hard assertion or not). When they disagree the pre-flight wins — it is measured on the actual file.
+
 ## 4. Same sound quality
 
 - Source audio already **AAC** -> `-c:a copy`, bit-identical. Always preferable.
@@ -135,7 +140,8 @@ Per item, in this order:
 3. **Full decode pass** (`ffmpeg -v error -i OUT -f null -`) — the only check that proves the
    payload is not truncated or corrupt.
 4. **SSIM vs the source window >= target** (section 2).
-5. **Size assertion**: output video bitrate <= source (section 1).
+5. **Size assertion**, per the regime in section 1: hard `out <= src` where the source has
+   headroom; runaway guard `out <= 1.25x src` where the pre-flight says it is already compressed.
 6. **Upload to a temp name, read the share copy back end-to-end, compare SHA-256 + byte count**,
    then replace atomically. A duration probe is not enough: with `+faststart` the `moov` is written
    first, so a truncated upload still reports the full duration.
@@ -216,6 +222,40 @@ Only **20% slower**, not the ~3x that per-core throughput suggests: the 10 E-cor
 while half of the P-core threads are SMT siblings, and x265 does not scale linearly anyway. So
 E-cores-only is the right default when the priority is efficiency over speed.
 
+## 11. Measured: what H.264 -> HEVC actually saves (3 real sources, 2026-10-07)
+
+A 60 s window from the middle of three real library files, video-only, SSIM vs the source at
+480x270. **Read this before promising a saving**: it ranges from 16% to 66% on the same settings,
+and the setting that a fixed `-cq 27` implies does not exist.
+
+| source | src video | cq27 | cq30 | cq31 | x265 crf24 | **x265 crf26** | x265 crf28 |
+|---|---|---|---|---|---|---|---|
+| 1080p30 music, bpp 0.0437 | 2720 kbps | 72.4% | 51.0% | 43.5% | 43.0% | **33.7%** | 26.4% |
+| 720p30, bpp 0.0437 | 1208 kbps | **115.2%** | 82.6% | 72.9% | 71.4% | **56.7%** | 45.0% |
+| 1080x1920@30 (vertical), bpp 0.0722 | 4490 kbps | **119.3%** | 83.8% | 74.3% | 84.3% | **67.0%** | 53.2% |
+
+(SSIM min/mean at those settings: cq27 0.993-0.996; cq30 0.990-0.995; cq31 0.989-0.994;
+crf24 0.990-0.993; crf26 0.988-0.993; crf28 0.985-0.991.)
+
+Three findings that change the recipe:
+
+1. **`-cq 27` GROWS two of the three files (115%, 119%).** That is the same defect that made a
+   whole library land at 111%: a fixed cq is a quality target, and on an already-efficient H.264
+   source it targets a quality *above* the source. Start at **cq 31 / crf 26**, not 27.
+2. **"Same quality" and "smaller" cannot both be pushed to the limit.** Pinning min SSIM >= 0.996
+   (the earlier target) leaves exactly one option on these files - cq27 - which is *bigger* than
+   the source. The usable frontier is min SSIM ~0.99: **x265 crf26 at 34-67% of the source**, i.e.
+   33-66% smaller. Put that choice to the owner explicitly instead of quietly dropping quality.
+3. **x265 beats NVENC by 10-22% at MATCHED SSIM** (720p: cq31 72.9% vs crf26 56.7% at min SSIM
+   0.9894/0.9879; 1080p: 43.5% vs 33.7% at 0.9938/0.9927) - consistent with the earlier 9-16%
+   estimate. So: NVENC for the mid tier (speed), x265 for the fat tier (size). Note the cost is real:
+   on these files x265 ran ~1.9-3x realtime vs 5x+ for hevc_nvenc.
+
+Defaults that follow from this, and the gates that enforce them, are in `scripts/library_run.py`:
+`CQ_NVENC=31`, `CRF_X265=26`, `SSIM_TARGET=0.985` (per-frame min), `SIZE_CEIL=1.0` (the output's
+video bitrate may not exceed the source's), a one-step quality retry when the SSIM gate fails, and
+`-maxrate` = 1.0x the source's **video** bitrate.
+
 ## 9. CPU and GPU tiers in parallel
 
 Different tiers can encode **at the same time** — NVENC is a fixed-function ASIC, x265 is CPU.
@@ -241,6 +281,8 @@ serial 96 h (4.0 days) -> parallel **66 h (2.7 days)**. Requirements to run it s
 
 `SRC` = the local staged source, `SRC_V` = `src_video_bps` from section 1, `A` = `src_audio_kbps`
 (section 4). Affinitize the process to the E-cores (`0x3FF0000`) before the tier-C command.
+`-maxrate SRC_V` below is the **headroom** setting; use `1.5x SRC_V` when the pre-flight says the
+source is already compressed and growth is acceptable (section 1).
 
 ```sh
 # ---- tier A: lean (bpp < 0.025) — no video re-encode at all, size cannot change

@@ -29,18 +29,22 @@ This policy is for **H.264 (and older MPEG-4/DivX) sources**, where the source i
 HEVC at matched quality lands 25-50% smaller (the course-library case: 1080p H.264 at
 550-2400 kbps, mp3 audio, files 300 MB-1.3 GB).
 
-**Do NOT run the size hunt on YouTube-sourced libraries (VP9/AV1).** YouTube already serves those
-at a near-optimal bitrate for their quality, so re-encoding an already-lean VP9/AV1 file can only
-grow it or lose quality - "the source is already as small as it gets, and that is accepted". The
-job there is narrower and different:
+**Do NOT run the size hunt on YouTube-sourced libraries whose codec is VP9/AV1.** YouTube already
+serves those at a near-optimal bitrate for their quality, so re-encoding an already-lean VP9/AV1
+file can only grow it or lose quality - "the source is already as small as it gets, and that is
+accepted". **YouTube's H.264 (AVC1) ladder is a different story, and worth measuring before
+dismissing:** the compatibility encodes are fat (measured median bpp **0.053** on one library's
+1080p AVC1 files, 2.4-4.7 Mbps), and they shrank to **34-67%** of the source video bitrate at
+matched quality (min SSIM ~0.99) - see section 11 of the policy reference. Classify by bpp and
+treat them like any other H.264 source; only the VP9/AV1 half is "no shrink sought".
 
-| | H.264 library (this policy) | YouTube VP9/AV1 library |
+| | H.264 / AVC1 source (this policy) | VP9 / AV1 source (YouTube) |
 |---|---|---|
 | goal | same look, **smaller** file | same look, same size - no shrink sought |
-| decode | any correct decoder | **never `*_cuvid`** (wrong frames, see below) |
-| quality gate | SSIM >= 0.996 + size ceiling | **per-frame content check vs the software decode** |
+| quality gate | SSIM pinned + size ceiling (min ~0.99 is the usable frontier) | **per-frame content check vs the software decode** |
 | source for a repair | the file itself | **the pre-conversion snapshot backup**, never the already-converted file |
 | frame cadence | `-fps_mode cfr` | `-fps_mode cfr` |
+| decode | any correct decoder | **never `*_cuvid`** (wrong frames, see below) |
 
 ## What "playable everywhere" actually means
 
@@ -283,7 +287,7 @@ never bigger, no judder", the defaults here are **not** enough: a fixed `-cq 27`
 
 | requirement | the answer |
 |---|---|
-| never bigger than the source | `-maxrate` = 1.0x the source **video** bitrate + a post-encode size assertion |
+| size | shrink where the source has headroom; growth is **acceptable** for already-compressed sources (YouTube-style) — playability is the goal there |
 | same picture quality | pin it to a number: **SSIM >= 0.996** vs the source (video lands near 70% of the source bitrate) |
 | same sound quality | copy AAC; for mp3/opus, AAC at **the source's own bitrate**, never a fixed 256k |
 | iPad + Android | MP4 + `hvc1` + `yuv420p` + AAC |

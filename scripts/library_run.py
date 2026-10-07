@@ -129,6 +129,42 @@ def run(cmd, timeout=86400, **kw):
                           errors="replace", timeout=timeout, **kw)
 
 
+STALL_S = 300   # an encode with no output growth for this long is wedged, not slow
+
+
+def run_watched(cmd, watch, stall_s=STALL_S, timeout=86400):
+    """run() with a STALL WATCHDOG on the file the command writes.
+
+    Measured: a hevc_nvenc encode sat FROZEN for 1.5 hours with its output unchanged - the user had
+    updated the NVIDIA driver while it was running, which wedges in-flight GPU work without any
+    error. A multi-day unattended run must recover from that by itself: no output growth for
+    `stall_s` -> kill the command and report a failure the normal retry path can pick up.
+    """
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         encoding="utf-8", errors="replace")
+    last, last_t, t0 = -1, time.time(), time.time()
+    while p.poll() is None:
+        time.sleep(30)
+        if time.time() - t0 > timeout:
+            p.kill()
+            p.communicate()
+            return subprocess.CompletedProcess(cmd, -1, "", "timeout after %d s" % timeout)
+        try:
+            sz = os.path.getsize(watch) if os.path.exists(watch) else 0
+        except OSError:
+            sz = last
+        if sz != last:
+            last, last_t = sz, time.time()
+        elif time.time() - last_t > stall_s:
+            p.kill()
+            out, err = p.communicate()
+            log("   !! STALL: no output growth for %d s - killed the wedged encode" % stall_s)
+            return subprocess.CompletedProcess(cmd, -9, out,
+                                               (err or "") + "\nkilled: wedged (no growth for %ds)" % stall_s)
+    out, err = p.communicate()
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
+
 # ---------------------------------------------------------------- integrity
 
 def _sha_local(path, label="local"):
@@ -364,9 +400,9 @@ def ssim_vs_source(src_local, out_local, info, workdir, tag, dur=SSIM_WINDOW):
     vf = ("trim=start=%.3f:end=%.3f,setpts=PTS-STARTPTS,scale=%s:flags=bilinear,format=yuv420p"
           % (start, start + dur, cmp_scale))
     for path, dstp in ((src_local, ref), (out_local, out)):
-        r = run([FFMPEG, "-y", "-v", "error", "-i", path,
-                 "-map", "0:v:0", "-an", "-vf", vf,
-                 "-fps_mode", "passthrough", "-f", "rawvideo", dstp], timeout=7200)
+        r = run_watched([FFMPEG, "-y", "-v", "error", "-i", path,
+                         "-map", "0:v:0", "-an", "-vf", vf,
+                         "-fps_mode", "passthrough", "-f", "rawvideo", dstp], dstp, timeout=7200)
         if r.returncode != 0 or not os.path.exists(dstp) or not os.path.getsize(dstp):
             return None, None, 0, None, {}
         counts.append(os.path.getsize(dstp) // (480 * 270 * 3 // 2))
@@ -512,7 +548,7 @@ def encode(src_local, dst_local, info, args, tier, vbps, q_off=0):
         cmd += ["-c:a", "aac", "-b:a", abr, "-ac", "2"]
     cmd += ["-movflags", "+faststart", dst_local]
     t0 = time.time()
-    r = run(cmd)
+    r = run_watched(cmd, dst_local)
     return r, time.time() - t0
 
 

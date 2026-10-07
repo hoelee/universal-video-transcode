@@ -94,6 +94,18 @@ def log(*a):
     print(time.strftime("%H:%M:%S") + " " + " ".join(str(x) for x in a), flush=True)
 
 
+def disp(p):
+    """Path for logs/ledger: relative to the library when possible.
+
+    A single-file run can point anywhere (measured: os.path.relpath raises ValueError when the file
+    is on D: and the library on Z:), so fall back to the absolute path.
+    """
+    try:
+        return os.path.relpath(p, ROOT)
+    except ValueError:
+        return p
+
+
 def probe(p, tries=3):
     """T.probe with retries: this share times a probe out (measured: 120 s for a 30 MB read), and
     one hiccup must not fail an item that is otherwise fine. The per-item try/except in the main
@@ -675,7 +687,8 @@ def process(src, args, dest=None, origin=None):
         os.replace(remote_tmp, live)
         # NEVER delete the source when it came from the snapshot origin: that is the archive of
         # the originals, and removing it would destroy the only clean copy of the library.
-        if not origin_used and os.path.abspath(live) != os.path.abspath(src):
+        if not origin_used and not getattr(args, "keep_source", False) \
+                and os.path.abspath(live) != os.path.abspath(src):
             os.remove(src)
         back = probe(live)
         tag_needed = (tier != "copy")
@@ -742,6 +755,13 @@ def main():
     ap.add_argument("--nvenc-preset", default=NVENC_PRESET)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--only", default=None, help="substring filter")
+    ap.add_argument("--path", default=None,
+                    help="convert this ONE file instead of the library tree (its tier is still "
+                         "chosen by the same bpp rule); pair with --dest to install it elsewhere")
+    ap.add_argument("--dest", default=None,
+                    help="install the result at this exact path (default: next to the source)")
+    ap.add_argument("--keep-source", action="store_true",
+                    help="never delete the source file after a verified install")
     ap.add_argument("--reverse", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-decode-check", action="store_true")
@@ -753,7 +773,13 @@ def main():
     DECODE_CHECK = not args.no_decode_check
 
     os.makedirs(STAGE, exist_ok=True)
-    files = collect(ROOT)
+    if args.path:
+        files = [args.path]
+        if not os.path.exists(args.path):
+            log("!!! no such file: %s" % args.path)
+            return
+    else:
+        files = collect(ROOT)
     if args.only:
         files = [f for f in files if args.only in f]
     if args.reverse:
@@ -766,7 +792,7 @@ def main():
     # One lock PER TIER, not one global lock: the copy tier uses no encoder, the x265 tier is CPU
     # and the nvenc tier is the GPU ASIC, so they are safe to run side by side whereas two runs of
     # the same tier would race on dst and starve a shared unit.
-    lockf = os.path.join(WORK, "run-%s.lock" % (args.tier or "all"))
+    lockf = os.path.join(WORK, "run-%s.lock" % (args.tier or ("single" if args.path else "all")))
     log("=== %d file(s)  tier=%s cq=%d crf=%d audio=%s decode_check=%s lock=%s" %
         (len(files), args.tier or "auto", args.cq, args.crf, args.audio or "source-matched",
          DECODE_CHECK, os.path.basename(lockf)))
@@ -776,7 +802,7 @@ def main():
         for f in files:
             info = probe(f)
             if not info:
-                log("PLAN %s -> UNREADABLE" % os.path.relpath(f, ROOT))
+                log("PLAN %s -> UNREADABLE" % disp(f))
                 continue
             vbps = src_video_bps(f, info)
             b = bpp_of(info, vbps)
@@ -784,7 +810,7 @@ def main():
             plan[t] = plan.get(t, 0) + 1
             log("PLAN %-5s bpp=%.4f %sx%s@%.0f %6.0f kbps %7.1f MB %s" % (
                 t, b, info["w"], info["h"], src_fps(info), vbps / 1000, info["size"] / 1e6,
-                os.path.relpath(f, ROOT)[:60]))
+                disp(f)[:60]))
         log("=== plan: %s" % plan)
         return
 
@@ -796,14 +822,17 @@ def main():
             if free < 8:
                 log("!!! ABORT: only %.1f GB free on C: - stopping" % free)
                 break
-            log("--- %d/%d %s" % (i, len(files), os.path.relpath(f, ROOT)))
+            log("--- %d/%d %s" % (i, len(files), disp(f)))
             t0 = time.time()
             origin = None
             if args.origin_root:
-                cand = os.path.join(args.origin_root, os.path.relpath(f, ROOT))
-                origin = cand if os.path.exists(cand) else None
+                try:
+                    cand = os.path.join(args.origin_root, os.path.relpath(f, ROOT))
+                except ValueError:
+                    cand = None
+                origin = cand if cand and os.path.exists(cand) else None
             try:
-                status, extra = process(f, args, dest=dst_path_for(f), origin=origin)
+                status, extra = process(f, args, dest=args.dest or dst_path_for(f), origin=origin)
             except Exception as e:
                 status, extra = "FAIL %s: %s" % (type(e).__name__, e), None
             el = time.time() - t0
@@ -819,7 +848,7 @@ def main():
                 stats["fail"] += 1
                 log("   !! %s" % status)
             ledger.write(json.dumps({"t": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                                     "path": os.path.relpath(f, ROOT), "status": status,
+                                     "path": disp(f), "status": status,
                                      "secs": round(el, 1), "extra": extra},
                                     ensure_ascii=False) + "\n")
             ledger.flush()

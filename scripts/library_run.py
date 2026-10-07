@@ -340,8 +340,13 @@ def ssim_vs_source(src_local, out_local, info, workdir, tag, dur=SSIM_WINDOW):
     """
     start = max(0.0, (info["dur"] / 2) - dur / 2)
     cmp_scale = "480:270"
-    ref = os.path.join(workdir, "ssim_ref.yuv")
-    out = os.path.join(workdir, "ssim_out.yuv")
+    # The raw frame files MUST be per-run: the tiers run side by side (by design - copy is I/O,
+    # x265 is CPU, nvenc is the GPU ASIC) and they share this stage directory, so fixed names let
+    # two concurrent gates overwrite each other's decodes. Measured: a comparison came out with
+    # 100% of frames below 0.85 (a convincing-looking 'systematic defect') that was nothing but two
+    # runs writing ssim_ref.yuv at the same time.
+    ref = os.path.join(workdir, "ssim_%d_%s_ref.yuv" % (os.getpid(), tag))
+    out = os.path.join(workdir, "ssim_%d_%s_out.yuv" % (os.getpid(), tag))
     counts = []
     # Decode WITHOUT an input seek, and cut the window with the trim filter on absolute PTS.
     #

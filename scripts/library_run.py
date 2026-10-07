@@ -668,6 +668,19 @@ def process(src, args, dest=None, origin=None):
         ok, msg = probe_ok(live, info, expect_vc)
         if not ok:
             return "FAIL post-replace gate on share: %s" % msg, None
+        # Metadata can lie on this share. RaiDrive/Dokan serves CACHED attributes, and a rename did
+        # not actually land for one file while every metadata probe insisted it had: the run
+        # reported "ok 1085 MB -> 478 MB" and the live file was still the H.264 original afterwards,
+        # with nothing anywhere reporting an error. So read the installed file back and compare its
+        # hash with what we encoded - the only check that cannot be served from a cache.
+        try:
+            h_back, n_back = _sha_remote(live)
+        except OSError as e:
+            return "FAIL install verify: cannot read the installed file back: %s" % e, None
+        if (h_back, n_back) != (h_loc, n_loc):
+            return ("FAIL install verify: the live file is NOT the encode we made "
+                    "(live %s/%d bytes vs ours %s/%d) - the replace did not land"
+                    % (h_back[:12], n_back, h_loc[:12], n_loc)), None
         return "ok", {"sha256": h_loc, "bytes": n_loc, "src_bytes": n_in,
                       "src_mb": round(info["size"] / 1e6, 1),
                       "out_mb": round(n_loc / 1e6, 1),

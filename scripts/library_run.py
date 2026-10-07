@@ -275,19 +275,25 @@ def ssim_vs_source(src_local, out_local, info, workdir, tag, dur=SSIM_WINDOW):
     ref = os.path.join(workdir, "ssim_ref.yuv")
     out = os.path.join(workdir, "ssim_out.yuv")
     counts = []
-    # Seek a little BEFORE the window and cut it with the trim filter on ABSOLUTE timestamps
-    # (`-copyts`): an input seek snaps to a keyframe, and it snapped to a *different* keyframe for
-    # the source and the encode (measured: two 1500-frame decodes whose start times differed by
-    # ~10 s -> SSIM mean 0.45 on a perfectly good encode). Trimming on PTS makes both sides cover
-    # exactly the same interval no matter where the seek landed.
-    seek = max(0.0, start - 20.0)
+    # Decode WITHOUT an input seek, and cut the window with the trim filter on absolute PTS.
+    #
+    # Two traps live here, both measured on real files in this library:
+    #   1. An input seek snaps to a keyframe, and it snaps to a DIFFERENT keyframe for the source
+    #      and for the encode (two 1500-frame decodes whose start times differed by ~10 s), so the
+    #      frames met the wrong partners and a good encode scored mean 0.45.
+    #   2. Worse, on an H.264 source with open GOPs an input seek decodes the frames after the
+    #      landing point differently from a sequential decode: the SAME file compared with itself,
+    #      once seeked and once decoded in order, scored min 0.25 / mean 0.82. A seek-based
+    #      reference therefore condemns perfectly good encodes.
+    # Sequential decoding costs a pass over the file up to the window at 480x270 - small next to the
+    # encode it is judging, and it is the only decode that is guaranteed to match what the encoder
+    # itself saw.
     vf = ("trim=start=%.3f:end=%.3f,setpts=PTS-STARTPTS,scale=%s:flags=bilinear,format=yuv420p"
           % (start, start + dur, cmp_scale))
     for path, dstp in ((src_local, ref), (out_local, out)):
-        r = run([FFMPEG, "-y", "-v", "error", "-copyts", "-ss", "%.2f" % seek,
-                 "-t", "%.2f" % (dur + 40), "-i", path,
+        r = run([FFMPEG, "-y", "-v", "error", "-i", path,
                  "-map", "0:v:0", "-an", "-vf", vf,
-                 "-fps_mode", "passthrough", "-f", "rawvideo", dstp], timeout=3600)
+                 "-fps_mode", "passthrough", "-f", "rawvideo", dstp], timeout=7200)
         if r.returncode != 0 or not os.path.exists(dstp) or not os.path.getsize(dstp):
             return None, None, 0, None
         counts.append(os.path.getsize(dstp) // (480 * 270 * 3 // 2))

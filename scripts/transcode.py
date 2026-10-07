@@ -30,6 +30,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 FFMPEG = os.environ.get("TRANSCODE_FFMPEG", "ffmpeg")
@@ -308,11 +309,29 @@ def out_path(src, args):
 
 class Lock:
     """One encoder at a time. Two concurrent NVENC jobs starve each other and drop frames -
-    the exact defect this tool exists to prevent - so cron runs must never overlap."""
+    the exact defect this tool exists to prevent - so cron runs must never overlap.
+
+    A lock carries a HEARTBEAT: a daemon thread touches the file every minute, so a live run's lock
+    is always fresh. Staleness is therefore decided by age first and pid second - killing a run
+    leaves its lock behind and the recorded pid can be REUSED by an unrelated process, which made a
+    pid-only check refuse to start a perfectly fine run (measured: a stale lock naming pid 29848,
+    which by then belonged to something else).
+    """
+
+    HEARTBEAT_S = 60
+    STALE_S = 300
 
     def __init__(self, path):
         self.path = path
         self.fd = None
+        self._stop = None
+
+    def _beat(self):
+        while not self._stop.wait(self.HEARTBEAT_S):
+            try:
+                os.utime(self.path, None)
+            except OSError:
+                return
 
     def __enter__(self):
         os.makedirs(os.path.dirname(os.path.abspath(self.path)) or ".", exist_ok=True)
@@ -324,17 +343,28 @@ class Lock:
                 pid = int(open(self.path).read().strip() or 0)
             except Exception:
                 pid = 0
-            if pid and _alive(pid):
-                raise SystemExit("another transcode is already running (pid %d, %s) - refusing "
-                                 "to start a second encoder" % (pid, self.path))
-            log("stale lock (pid %s gone) - taking it over" % pid)
-            os.remove(self.path)
-            self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            age = time.time() - os.path.getmtime(self.path)
+            if age < self.STALE_S and pid and _alive(pid):
+                raise SystemExit("another transcode is already running (pid %d, %s, %.0f s old) - "
+                                 "refusing to start a second encoder" % (pid, self.path, age))
+            log("stale lock (pid %s, %.0f s old) - taking it over" % (pid, age))
+            try:
+                os.remove(self.path)
+            except OSError:
+                # A dead process can leave its handle on the file for a while (the remove fails
+                # with 'Device or resource busy' on Windows). Overwrite in place instead of
+                # crashing: the content is ours from here and the heartbeat keeps it fresh.
+                log("could not remove the stale lock file - overwriting it in place")
+            self.fd = os.open(self.path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
             os.write(self.fd, str(os.getpid()).encode())
+        self._stop = threading.Event()
+        threading.Thread(target=self._beat, daemon=True).start()
         return self
 
     def __exit__(self, *a):
         try:
+            if self._stop is not None:
+                self._stop.set()
             if self.fd is not None:
                 os.close(self.fd)
             os.remove(self.path)

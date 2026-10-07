@@ -94,6 +94,24 @@ def log(*a):
     print(time.strftime("%H:%M:%S") + " " + " ".join(str(x) for x in a), flush=True)
 
 
+def probe(p, tries=3):
+    """T.probe with retries: this share times a probe out (measured: 120 s for a 30 MB read), and
+    one hiccup must not fail an item that is otherwise fine. The per-item try/except in the main
+    loop would have turned a hiccup into a FAIL, leaving the file unconverted."""
+    last = None
+    for a in range(1, tries + 1):
+        try:
+            v = T.probe(p)
+            if v:
+                return v
+            last = "no streams"
+        except Exception as e:
+            last = e
+        log("   ! probe attempt %d/%d failed (%s) - retrying" % (a, tries, last))
+        time.sleep(5 * a)
+    raise IOError("could not probe %s after %d attempts: %s" % (p, tries, last))
+
+
 def run(cmd, timeout=86400, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                           errors="replace", timeout=timeout, **kw)
@@ -506,7 +524,7 @@ def already_hevc(src, info):
 
 
 def process(src, args, dest=None, origin=None):
-    info = T.probe(src)
+    info = probe(src)
     if not info:
         return "FAIL unreadable", None
     if info["dur"] < 1.0:
@@ -527,7 +545,7 @@ def process(src, args, dest=None, origin=None):
                 info["size"] / 1e6, o_size / 1e6), None
         log("   re-doing from the original: live %.0f MB > original %.0f MB" % (
             info["size"] / 1e6, o_size / 1e6))
-        src, info = origin, T.probe(origin)
+        src, info = origin, probe(origin)
         if not info:
             return "FAIL original unreadable", None
 
@@ -659,7 +677,7 @@ def process(src, args, dest=None, origin=None):
         # the originals, and removing it would destroy the only clean copy of the library.
         if not origin_used and os.path.abspath(live) != os.path.abspath(src):
             os.remove(src)
-        back = T.probe(live)
+        back = probe(live)
         tag_needed = (tier != "copy")
         if not back or back["vcodec"] != expect_vc \
                 or (tag_needed and back["tag"] != "hvc1") \
@@ -756,7 +774,7 @@ def main():
     if args.dry_run:
         plan = {}
         for f in files:
-            info = T.probe(f)
+            info = probe(f)
             if not info:
                 log("PLAN %s -> UNREADABLE" % os.path.relpath(f, ROOT))
                 continue

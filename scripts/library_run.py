@@ -133,6 +133,17 @@ def copy_remote_to_local(remote, local, expect_size=None, tries=5):
                 os.fsync(fo.fileno())
             if expect_size and n != expect_size:
                 raise IOError("short read: got %d, container says %d" % (n, expect_size))
+            # A read of the RIGHT LENGTH can still be wrong on this share: RaiDrive reports stale
+            # sizes, and a listing read here stopped halfway with no error at all (it looked like a
+            # truncated file and was not). A corrupt staged source would be encoded into a corrupt
+            # output, so pay for one more pass and compare hashes of what we wrote against a fresh
+            # read of the share copy.
+            if n > (64 << 20):
+                a = _sha_local(local, "staged source")
+                b = _sha_remote(remote, "share source")
+                if a != b:
+                    raise IOError("staged source hash mismatch (local %s.. != share %s..)"
+                                  % (a[:12], b[:12]))
             return n
         except OSError as e:
             log("   ! source copy attempt %d/%d failed: %s" % (attempt, tries, e))

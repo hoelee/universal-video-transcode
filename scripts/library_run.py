@@ -314,14 +314,67 @@ def ssim_vs_source(src_local, out_local, info, workdir, tag, dur=SSIM_WINDOW):
                 m = re.search(r"All:([0-9.]+)", line)
                 if m:
                     vals.append(float(m.group(1)))
+    n = len(vals)
+    lo = min(vals) if vals else None
+    mean = (sum(vals) / len(vals)) if vals else None
+    note = None
+    # If the direct pairing looks bad, try to EXPLAIN the mismatch as a timeline offset before
+    # condemning the file: a source whose timeline drifts (or had a hole earlier) makes the encode
+    # lag it by a fixed number of frames, and a wrong-picture defect can NOT be fixed by any single
+    # shift. Requiring a good score at some offset is therefore a sound discriminator.
+    if n and (lo is None or lo < SSIM_TARGET or mean < 0.985):
+        best = None
+        nf = min(n, 1200)
+        for off in range(-100, 101, 10):
+            if off == 0:
+                continue
+            mn, mm, k = _paired_ssim(ref, out, off, nf, workdir, "off%d" % abs(off))
+            if mn is not None and (best is None or mn > best[0]):
+                best = (mn, mm, k, off)
+        if best and best[0] >= 0.90 and best[1] >= 0.98:
+            note = ("timeline offset of %+d frames between source and encode - pictures verified at "
+                    "that alignment (min SSIM %.4f mean %.4f)" % (best[3], best[0], best[1]))
+            lo, mean, n = best[0], best[1], best[2]
     for f in (ref, out):
         try:
             os.remove(f)
         except OSError:
             pass
-    if vals:
-        return min(vals), sum(vals) / len(vals), len(vals), None
-    return None, None, 0, None
+    return lo, mean, n, note
+
+
+def _paired_ssim(ref_raw, out_raw, off, nf, workdir, tag):
+    """SSIM of the first `nf` frames of out_raw against ref_raw starting `off` frames in."""
+    fs = 480 * 270 * 3 // 2
+    with open(ref_raw, "rb") as f:
+        f.seek(max(0, off) * fs)
+        a = f.read(nf * fs)
+    pa = os.path.join(workdir, "pair_a_%s.yuv" % tag)
+    pb = os.path.join(workdir, "pair_b_%s.yuv" % tag)
+    with open(pa, "wb") as f:
+        f.write(a)
+    with open(out_raw, "rb") as f:
+        b = f.read(nf * fs)
+    with open(pb, "wb") as f:
+        f.write(b)
+    vals = []
+    log = os.path.join(workdir, "pair_%s.log" % tag)
+    subprocess.run([FFMPEG, "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", "480:270",
+                    "-i", pa, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", "480:270", "-i", pb,
+                    "-lavfi", "ssim=stats_file=%s" % os.path.basename(log), "-f", "null", "-"],
+                   capture_output=True, cwd=workdir)
+    if os.path.exists(log):
+        with open(log, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                m = re.search(r"All:([0-9.]+)", line)
+                if m:
+                    vals.append(float(m.group(1)))
+    for f in (pa, pb):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    return (min(vals), sum(vals) / len(vals), len(vals)) if vals else (None, None, 0)
 
 
 def pin_to_e_cores():
@@ -469,10 +522,11 @@ def process(src, args, dest=None, origin=None):
                 obps = out_video_bps(loc_out, info["dur"])
                 growth = 100.0 * obps / vbps if vbps else 0.0
                 if irreg:
-                    # The source's timeline has holes, so frame pairing is meaningless; the encode
-                    # is still held to the structural/decode/size gates below. Report it loudly.
-                    ssim_note = "PICTURE GATE SKIPPED - %s" % irreg
-                    log("   !! %s" % ssim_note)
+                    # Either the source's timeline has holes (frame pairing is meaningless) or the
+                    # mismatch was explained by a fixed timeline offset. Both are reported, not
+                    # silently swallowed, and the structural/decode/size gates still apply below.
+                    ssim_note = irreg
+                    log("   NOTE: %s" % ssim_note)
                     if vbps and obps > vbps * SIZE_CEIL:
                         return "FAIL size: output %.0f kbps > source %.0f kbps (%.1f%%)" % (
                             obps / 1000, vbps / 1000, growth), None

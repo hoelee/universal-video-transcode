@@ -258,6 +258,9 @@ re-encoded to `-b:a 256k`: that added ~128 kbps for no audible gain, ~+10% file 
 1.3 Mbps file - enough to cancel the video saving on its own. AAC is more efficient than mp3, so
 `-b:a` = the source's own audio bitrate (clamped, e.g. 96-256k) is already a quality upgrade.
 
+- **Never build a verification harness on a stream-copy cut.** `-ss X -c copy` on an H.264 file with B-frames loses packets (measured: a 60 s cut of a 25 fps source yielded 1270 frames instead of 1500, with the content shifted after each dropped packet), so an encode of that cut can never line up with anything and the comparison reports a fake SSIM 0.25 minimum. Compare whole files (or byte-copies of them): a byte copy is faithful, a stream copy is not. Corollary - before believing any picture verdict, make the harness prove itself on a file against ITSELF (must be lo=1.0).
+- **Time-box a single-file mystery.** When one file resists diagnosis after a couple of experiments, park it (leave it untouched, log it as 'gate could not verify'), report it, and move on - a library run must not stall on one item. Revisit parked files in a batch later.
+
 ## Pitfalls
 
 - **A RaiDrive/Dokan write can return with NO error while the file is a fraction of what it should be.** Measured: a 403 MB upload left 12.5 MB on the share, and RaiDrive's own "the operation didn't complete within specific time limit" toast arrived *after* the write had already returned success. Never trust a write to a Dokan-backed share: hash the local file, hash the share copy back, compare size AND SHA-256, and only then rename. On a mismatch, retry the upload (it usually works on the second attempt) rather than failing the item. Uploads should use small chunks (4 MB) with a periodic `flush`+`fsync`; a partial `*.new.mp4`/`*.part.mp4` must be deleted, never resumed from `os.path.getsize()` on the share (RaiDrive reports stale sizes, so a resume offset taken from it corrupts the file).

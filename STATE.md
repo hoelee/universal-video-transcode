@@ -1,25 +1,65 @@
-# STATE — 樊登读书会媒体库转码（2026-10-07/08）
+# STATE — 樊登读书会媒体库转码（2026-10-08 10:50 更新）
 
 给下一个会话的交接。**权威运行器：`scripts/library_run.py`**（不要再恢复旧的 `hevc_lib.py`）。
 
 ## 现在在跑什么
 
+两个 HEVC 档在跑，各自独立的锁（`run-x265.lock` / `run-nvenc.lock`；x265 = E 核，nvenc = GPU ASIC，互不争抢）。
+
+**它们不在 Hermes 的进程管理里** → `process_manage` 看不到，也没有退出通知：只能看日志、按 PID 杀。
+
 ```bash
-# 两个档并行（各自独立的锁：run-x265.lock / run-nvenc.lock），GPU 与 CPU 互不争抢
-cd /d/dev/universal-video-transcode
-python -u scripts/library_run.py --tier x265  --origin-root "Z:\Class\#snapshot\GMT+08-2026.09.25-09.50.20\樊登读书\樊登读书会（每周更新）" --reverse >> /d/tmp/xcode/run_x265.log 2>&1
-python -u scripts/library_run.py --tier nvenc --origin-root "Z:\Class\#snapshot\GMT+08-2026.09.25-09.50.20\樊登读书\樊登读书会（每周更新）" --reverse >> /d/tmp/xcode/run_nvenc.log 2>&1
+# 断点续跑（幂等：已转好的自动跳过，失败项文件未动，下一轮自动重做），每档最多重试 8 次
+bash /d/tmp/xcode/relaunch_tiers.sh
+
+# 看进度
+tail -f /d/tmp/xcode/run_x265.log /d/tmp/xcode/run_nvenc.log
 ```
 
-- **copy 档已整轮完成**：`=== done: ok=193 skipped=389 failed=0`（视频逐位不变 + 音频转 AAC）。无需再跑。
-- 预期：x265 ~3.5 天、nvenc ~3 天跑完全库（582 文件 / ~324 GB）。
-- 断点续跑天然幂等：已转好的文件（HEVC 且 ≤ 原档大小）自动跳过；失败项文件未动，下一轮自动重做。
+### 为什么改成"脱管"启动 —— 10:37 那次全停的教训（第 9 个 bug）
+
+上一轮的 x265 / nvenc 是 Hermes 后台进程。**用户停会话时它们被一起杀了**：两个都停在编码到一半
+（stage 里 `*_out.mp4` 和 `.err` 停在 10:37，日志里没有 `PASS-DONE`），所以 `persist_on_release` 在这个
+环境里**不可靠**。现在两档由 `powershell Start-Process` 拉起的独立 bash 启动，父进程立刻退出 →
+进程树成为孤儿，**Hermes 的清理碰不到它们**。
+
+代价与规矩：没有退出通知（看日志）；**停/杀只能按 PID**，绝不用进程名批量杀。
+
+## 进度（2026-10-08 10:50，库内共 589 个文件）
+
+| 档 | 已转好 | 待转 |
+|---|---|---|
+| copy | 160 | 4（见下） |
+| x265 | 13 | 169 |
+| nvenc | 25 | 174 |
+| 无需处理（已达播发标准） | 44 | — |
+| **合计** | **242** | **347** |
+
+- 预期：x265 ~3.5 天、nvenc ~3 天跑完各自那档（这一轮 10:43 才重新起来，10:37 被上面那次全停打断）。
+- 台账：`C:\AI\transcode-run\ledger.jsonl`（每项一行：分类/结果/大小/SSIM）。
+- 进度只认台账与 state，**不看 `.mp4` 扩展名**（TubeSync 重命名会把它改回 `.mkv`）。
+
+## 2026-10-08 新增的 4 集"每周更新"（copy 档）
+
+`1004 反内卷` `0912 感官觉醒` `0905 如何成为情绪稳定的父母` `0822 超赞的一代`（都在 `樊登读书2026年（更新中）`）：
+H.264 + **mp3** 音轨，其中 `0822 超赞的一代` 其实是 **MPEG-TS** 只是挂着 .mp4 名 → iPad 播不了，
+需要 copy 档（视频逐位不变 + 音轨转 AAC）。
+
+⚠ **不要跑整轮 `--tier copy`**：copy 档唯一的跳过判据是"已经是 HEVC"，而 copy 的产物是 H.264 ——
+整轮会把 193 个已转好的 copy 文件全部重做一遍。改用单文件通道：
+
+```bash
+bash /d/tmp/xcode/convert_new4.sh     # 逐个 --tier copy --path <file> --keep-source，共用 run-copy.lock
+```
+
+- `1004 反内卷` 10:48:53 完成 ✓（535 MB → 535 MB，视频 100% 逐位不变，音频转 AAC，149 s，rc=0）
 
 ## 目录与日志
 
 | 用途 | 路径 |
 |---|---|
-| 运行日志 | `/d/tmp/xcode/run_x265.log`、`run_nvenc.log`、`run_copy.log` |
+| 运行日志 | `/d/tmp/xcode/run_x265.log`、`run_nvenc.log`、`run_copy.log`、`run_new4.log` |
+| 脱管启动器 / 新集转换 | `/d/tmp/xcode/relaunch_tiers.sh`、`convert_new4.sh`（+ `relauncher.out`）；**源在仓库 `run/`**（改仓库那份再拷出来） |
 | 单文件日志 | `/d/tmp/xcode/run_single.log` |
 | 暂存目录（编码/闸门 raw） | `C:\AI\transcode-run\stage`（C: 盘，要留 ≥8 GB） |
 | 台账（每项一行 JSON） | `C:\AI\transcode-run\ledger.jsonl` |
@@ -35,6 +75,7 @@ python -u scripts/library_run.py --tier nvenc --origin-root "Z:\Class\#snapshot\
 6. **probe 单次失败即判文件失败** → 加**重试 3 次**。
 7. **看门狗用 stderr 管道**（本轮最贵的 bug）→ ffmpeg `-stats` 每 0.5 s 一行，64 KB 管道几分钟塞满 → ffmpeg 阻塞在 write() → 输出不增长 → 看门狗**误杀好编码**（整夜 ~270 杀、只转成 24 个、GPU 0%）。修：**stderr 写文件**，阈值 5→15 分钟。自检脚本 `D:\dev\hoelee-tubesync-management\cache\watchdog_selfcheck.py`。
 8. 看门狗**保留**（它要防的是真实场景：用户更新 NVIDIA 驱动会把在跑的 NVENC 冻死 1.5 小时且不报错）。
+9. **Hermes 后台进程会随会话一起被杀** —— 两个档在 10:37 同时死在编码中，日志里没有 `PASS-DONE`；改脱管启动（见上）。
 
 ## 未完成 / 待办
 
@@ -61,5 +102,5 @@ python scripts/library_run.py --dry-run --limit 20
 
 - **绝不删除/覆盖快照原档**（`#snapshot` 是唯一的干净档案）。
 - 失败时**不动 live 文件**；只有"结构 + 全解码 + 图片闸门 + 上传回读 + 安装回读"全过才替换。
-- 杀进程**只按 PID**（绝不用进程名批量杀）；一档一个锁；同一档不要跑两个实例。
+- 杀进程**只按 PID**（绝不用进程名批量杀，`taskkill /IM ffmpeg.exe` 会连带杀掉别人的编码）；一档一个锁；同一档不要跑两个实例。
 - 动 GPU（更新驱动/跑 ComfyUI/加载大模型）前先暂停 nvenc 档。

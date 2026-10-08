@@ -263,33 +263,20 @@ re-encoded to `-b:a 256k`: that added ~128 kbps for no audible gain, ~+10% file 
 
 - **Killing a background session may not kill the process.** The session is a wrapper around the command; killing the session left the real python alive holding its lock, so the next start was refused by a lock that was telling the TRUTH while the log looked like a stale-lock bug. Check the real PID before concluding (`powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'ProcessId=<N>' | Select ProcessId,ParentProcessId,CreationDate,CommandLine"`) and kill that PID. Corollary, now implemented in `Lock`: the lock file is touched by a heartbeat every minute and staleness is decided by age (5 min) as well as pid, and a takeover that cannot remove a file still held by the OS overwrites it in place instead of crashing.
 
+- **A watchdog that reads a PIPE can kill healthy work; send child stderr to a FILE.** ffmpeg with `-stats` writes a line every 0.5 s; a 64 KB pipe fills within minutes, ffmpeg blocks in `write()` on stderr, its OUTPUT stops growing - and a stall watchdog then kills a perfectly good encode. Measured: ~270 kills in one night, 24 files converted, encoder sitting at 0% with the process alive. Pipes are for bounded output only; a multi-minute encode goes to a log file, read back afterwards for the error text.
+- **Watchdogs earn their keep: a driver update wedges GPU work silently.** The user updated the NVIDIA driver while a `hevc_nvenc` encode ran: the process stayed alive, output stopped growing, the encoder read 0%, and NOTHING reported an error - the tier sat frozen for 1.5 hours. Tell the user to pause GPU tiers before touching the driver, and keep an output-growth watchdog (14 min window) so it self-heals either way.
+- **Metadata on a Dokan share is a CACHE, so verify installed files by content.** A rename (`os.replace`) did not land for one file while every ffprobe probe insisted it had: the run logged `ok 1085 MB -> 478 MB` and the live file was still the original H.264, with no error anywhere. After installing, read the file back and compare its SHA-256 with the encode; that check cannot be served from a cache. (Same share: `getsize()` lies, so never resume an upload from a share-reported size.)
+- **Give concurrent runs their own temp files.** Tiers run side by side by design (copy = I/O, x265 = CPU, nvenc = GPU ASIC) and share the stage directory; fixed temp names let two gates overwrite each other's decodes and report a fake `100% of frames below 0.85 - systematic defect`. Tag every temp with the pid AND the file.
+- **Separate the single-file path from the tree walk.** `--path FILE --dest TARGET --keep-source` runs one file anywhere on disk through the same tier rule, gates and hash-verified install. Watch out: `os.path.relpath` raises ValueError across drives (file on D:, library on Z:) - fall back to the absolute path, and the dest overrides where the install lands (all post-install checks must then probe the DEST, not the source).
+
 ## Pitfalls
 
-- **A RaiDrive/Dokan write can return with NO error while the file is a fraction of what it should be.** Measured: a 403 MB upload left 12.5 MB on the share, and RaiDrive's own "the operation didn't complete within specific time limit" toast arrived *after* the write had already returned success. Never trust a write to a Dokan-backed share: hash the local file, hash the share copy back, compare size AND SHA-256, and only then rename. On a mismatch, retry the upload (it usually works on the second attempt) rather than failing the item. Uploads should use small chunks (4 MB) with a periodic `flush`+`fsync`; a partial `*.new.mp4`/`*.part.mp4` must be deleted, never resumed from `os.path.getsize()` on the share (RaiDrive reports stale sizes, so a resume offset taken from it corrupts the file).
-- **Those same toasts are an overload signal, not a permission problem.** Three jobs reading/writing one share provoked both the truncated write above and `[Errno 9] Bad file descriptor` on a 1 GB staged read; writing into the library folder itself was perfectly fine (verified by creating and deleting a file there). Cap the concurrency at two jobs (one CPU tier + one GPU tier), give each tier its own lock file, and make the lock take over a stale one (pid gone).
-- **Compare pictures by TIMESTAMP, never by frame index after an input seek.** An input `-ss` snaps to a keyframe, and it snaps to a *different* keyframe for the source and for the encode - measured: two 1500-frame decodes whose start times differed by ~10 s, so every frame met the wrong one and a perfectly good encode scored min SSIM 0.25. Cut the window with the `trim` filter on absolute PTS (`-copyts -ss <before window> -i in -vf "trim=start=X:end=Y,setpts=PTS-STARTPTS,..."`). Validate the method by comparing a file against ITSELF: it must read lo=1.0/mean=1.0, otherwise the harness is broken and every verdict it produces is noise.
-- **If the frame counts in the sampled window differ by more than ~1%, the picture gate is NOT APPLICABLE - do not fail the file.** A source with holes in its timeline (measured: 1459 frames where 1500 belong, a 1.7 s hole) is *supposed* to gain duplicated frames from `-fps_mode cfr`; after the hole every frame pairs with the wrong one and SSIM collapses. Report the condition and let the structural/decode/size gates carry the verdict.
-- **File paths with a space before the extension are NOT the problem they look like** - `1130 维特根斯坦十讲 .mp4` opened and streamed fine. Suspect the share, not the name.
-- **Never kill encoders by process name.** `Get-Process ffmpeg | Stop-Process -Force` also killed an unrelated pilot encode that was running legitimately (rc=-1 mid-encode). Kill the specific background PID, or the specific `ffmpeg` PID you started.
-
-- **Never write the encode output directly to a network share.** A streaming `.part` write over
-  SMB/SFTP/Dokan leaves a corrupt stub when the connection blips. Encode to local disk, verify,
-  then copy the complete file across. The tool writes `dst + ".part.mp4"` and renames only after
-  verification — keep it on a local path if the destination is remote.
-- **`os.path.getsize()` lies on RaiDrive/Dokan** — it returns cached metadata from the *previous*
-  file handle. Verify a network copy by sequential chunked read, never by size.
-- **A `.mkv` extension on a converted file is cosmetic.** TubeSync's rename pass rewrites
-  finished `.mp4` files back to `.mkv` while `downloaded_container` still reads `mp4`, and
-  `Content-Type` follows the container. Do not "fix" it and do not report it as a playback bug.
-- **Do not re-download to fix a timing defect.** The mkv that yt-dlp writes is itself flat, so a
-  re-download reproduces the defect exactly.
-- **A `-c copy` remux cannot repair timing.** ffmpeg will not rewrite `stts`/`ctts` under stream
-  copy, and retiming only the SPS (`-bsf:v h264_metadata=tick_rate=…`) changes nothing either.
-  Repairing a copy-tier file means re-encoding its video — quote the size cost (1.28x at crf 23,
-  1.74x at crf 20) before applying it to a whole library.
-- **Unicode paths**: on Windows, drive ffmpeg from Python `subprocess` with an argv list. MSYS
-  bash cannot hand a Chinese filename to native `ffmpeg.exe` even when `ls` shows it.
-- **`-hwaccel cuda` alone may still software-decode VP9**; `-c:v vp9_cuvid` forces NVDEC.
+- **Five-step pipeline, no exceptions**: decode → encode → `verify()` → `verify_content()` / SSIM gate → hash-verified install. A file is replaced ONLY when every step passed; a failure leaves the live file untouched.
+- **Never trust this share's metadata**: read files back and compare SHA-256 (a rename can silently not land); never resume a write from a share-reported size.
+- **Never build a verification harness on a stream copy or a seek**: compare whole files, decode both sides sequentially, and prove the harness on a file against itself (must be lo=1.0).
+- **Judge a defect's SHAPE, not one frame**: mean < 0.98 or > 1% of frames below 0.85 fails; a handful of scattered low frames at a healthy mean is a fade, and SSIM on near-flat frames means nothing.
+- **Kill by PID only**, one lock per tier, one NVENC job at a time, and pause GPU tiers before a driver update (an update wedges GPU work silently — the output-growth watchdog is the net).
+- **Full measured detail, every failure mode and its detector: `references/pitfalls.md`.**
 
 ## The owner's standing requirements — read this first
 

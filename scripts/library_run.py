@@ -129,7 +129,7 @@ def run(cmd, timeout=86400, **kw):
                           errors="replace", timeout=timeout, **kw)
 
 
-STALL_S = 300   # an encode with no output growth for this long is wedged, not slow
+STALL_S = 900   # an encode with no output growth for this long is wedged, not slow
 
 
 def run_watched(cmd, watch, stall_s=STALL_S, timeout=86400):
@@ -139,30 +139,46 @@ def run_watched(cmd, watch, stall_s=STALL_S, timeout=86400):
     updated the NVIDIA driver while it was running, which wedges in-flight GPU work without any
     error. A multi-day unattended run must recover from that by itself: no output growth for
     `stall_s` -> kill the command and report a failure the normal retry path can pick up.
+
+    NB the child's stderr goes to a FILE, never a pipe. ffmpeg with `-stats` writes a line every
+    0.5 s, which fills a 64 KB pipe within minutes; a blocked ffmpeg stops writing its output, so
+    the watchdog then kills a perfectly healthy encode (measured: ~270 kills in one night, almost no
+    work done, while the encoder sat idle in write() on stderr).
     """
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                         encoding="utf-8", errors="replace")
-    last, last_t, t0 = -1, time.time(), time.time()
-    while p.poll() is None:
-        time.sleep(30)
-        if time.time() - t0 > timeout:
-            p.kill()
-            p.communicate()
-            return subprocess.CompletedProcess(cmd, -1, "", "timeout after %d s" % timeout)
-        try:
-            sz = os.path.getsize(watch) if os.path.exists(watch) else 0
-        except OSError:
-            sz = last
-        if sz != last:
-            last, last_t = sz, time.time()
-        elif time.time() - last_t > stall_s:
-            p.kill()
-            out, err = p.communicate()
-            log("   !! STALL: no output growth for %d s - killed the wedged encode" % stall_s)
-            return subprocess.CompletedProcess(cmd, -9, out,
-                                               (err or "") + "\nkilled: wedged (no growth for %ds)" % stall_s)
-    out, err = p.communicate()
-    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+    errf = watch + ".err"
+    err = ""
+    with open(errf, "wb") as ferr:
+        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=ferr)
+        last, last_t, t0 = -1, time.time(), time.time()
+        while p.poll() is None:
+            time.sleep(30)
+            if time.time() - t0 > timeout:
+                p.kill()
+                p.wait()
+                err = "timeout after %d s" % timeout
+                break
+            try:
+                sz = os.path.getsize(watch) if os.path.exists(watch) else 0
+            except OSError:
+                sz = last
+            if sz != last:
+                last, last_t = sz, time.time()
+            elif time.time() - last_t > stall_s:
+                p.kill()
+                p.wait()
+                log("   !! STALL: no output growth for %d s - killed the wedged encode" % stall_s)
+                err = "killed: wedged (no growth for %ds)" % stall_s
+                break
+    try:
+        with open(errf, "rb") as f:
+            data = f.read()
+        tail = data[-4000:].decode("utf-8", "replace")
+        err = (tail + "\n" + err).strip()
+        os.remove(errf)
+    except OSError:
+        pass
+    rc = p.returncode if p.returncode is not None else -9
+    return subprocess.CompletedProcess(cmd, rc, "", err)
 
 
 # ---------------------------------------------------------------- integrity

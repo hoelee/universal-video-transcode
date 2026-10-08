@@ -1,0 +1,3 @@
+# Shell scripts are checked out with LF: core.autocrlf=true would otherwise write CRLF into
+# the blobs' working copy and bash refuses a script whose lines end in CR.
+*.sh text eol=lf

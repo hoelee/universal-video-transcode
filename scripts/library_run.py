@@ -88,6 +88,15 @@ SIZE_CEIL = 1.0          # output video bitrate must not exceed the source's
 QUALITY_STEPS = 2        # on a quality-gate failure, retry with the quality raised this many
                          # steps (cq -2 / crf -2) before giving up; the retry only fires on a
                          # file the cheaper setting could not carry
+SSIM_MEAN_MIN = 0.98     # the window-mean bar for a normal encode
+SSIM_MEAN_MIN_REDO = 0.975   # ... and for a RE-DO of a file that already plays everywhere
+                         # (HEVC hvc1 + AAC). Owner decision 2026-10-08: measured on this library,
+                         # 11 of a pass's attempts died on a mean of 0.9655-0.9795 while files with
+                         # WORSE frame minima (0.33-0.90) passed - the bar was splitting a
+                         # continuum, not separating defects (0718 马斯克原理 failed with 0.00% of
+                         # frames below 0.85 and min 0.887). A re-do's only job is to reclaim the
+                         # old settings' bloat, so it must not be stranded with the bigger file for
+                         # ever; 0.975 still rejects the two genuine stragglers (0.9655, 0.9739).
 
 
 def log(*a):
@@ -599,6 +608,7 @@ def process(src, args, dest=None, origin=None):
     if info["dur"] < 1.0:
         return "FAIL stub (%.1fs) - needs a re-download, not a transcode" % info["dur"], None
     live = dest or dst_path_for(src)
+    redo_playable = False    # True once we know this run is re-doing a file that ALREADY plays
 
     if info["vcodec"] == "hevc" and info["tag"] == "hvc1" and info["pix"] in ("yuv420p",) \
             and not T.unusable_timeline(info, src)[0]:
@@ -614,6 +624,14 @@ def process(src, args, dest=None, origin=None):
                 info["size"] / 1e6, o_size / 1e6), None
         log("   re-doing from the original: live %.0f MB > original %.0f MB" % (
             info["size"] / 1e6, o_size / 1e6))
+        # A re-do replaces a file that already plays on iPad + Android; its only purpose is to
+        # reclaim the old settings' bloat, so it earns the relaxed mean bar (owner decision,
+        # SSIM_MEAN_MIN_REDO) - but only when the live file really is playable end to end
+        # (HEVC hvc1 video, which the branch above guarantees, plus AAC audio).
+        redo_playable = info["acodec"] in ("aac", "mp4a")
+        if not redo_playable:
+            log("   re-do of a file whose audio is %s (not playable) - the normal bar applies"
+                % (info["acodec"] or "none"))
         src, info = origin, probe(origin)
         if not info:
             return "FAIL original unreadable", None
@@ -687,17 +705,24 @@ def process(src, args, dest=None, origin=None):
                 # Measured on this library: good encodes 0 of 1500 frames below 0.95; the file that
                 # triggered this rule 5 of 1500 below 0.85 (0.33%) at 0.98 mean; the genuine
                 # decoder-defect files 44 of 1499 (2.9%) with the mean falling too.
+                # The MEAN bar is 0.975 instead of 0.98 when this is a re-do of a file that already
+                # plays (SSIM_MEAN_MIN_REDO) - the frame-share test below is unchanged and is what
+                # actually catches a defect.
                 bad_share = (sstat.get("below", 0) / float(nfr)) if nfr else 0.0
-                systematic = (mean is not None and mean < 0.98) or bad_share > MAX_BAD_SHARE
+                mean_min = SSIM_MEAN_MIN_REDO if redo_playable else SSIM_MEAN_MIN
+                systematic = (mean is not None and mean < mean_min) or bad_share > MAX_BAD_SHARE
                 if systematic:
                     if q_off < QUALITY_STEPS and (attempt == 1):
                         q_off = QUALITY_STEPS
-                        log("   quality gate: mean %.4f, %d of %d frames below %.2f (%.2f%%) - "
-                            "retrying at quality+%d" % (mean, sstat.get("below", 0), nfr,
-                                                        BAD_FRAME_SSIM, 100.0 * bad_share, q_off))
+                        log("   quality gate: mean %.4f < bar %.3f, %d of %d frames below %.2f "
+                            "(%.2f%%) - retrying at quality+%d" % (
+                                mean, mean_min, sstat.get("below", 0), nfr,
+                                BAD_FRAME_SSIM, 100.0 * bad_share, q_off))
                         continue
-                    return ("FAIL quality: %s - systematic: mean %.4f, %.2f%% of frames below %.2f"
-                            % (ssim_note, mean, 100.0 * bad_share, BAD_FRAME_SSIM)), None
+                    return ("FAIL quality: %s - systematic: mean %.4f < bar %.3f, %.2f%% of frames "
+                            "below %.2f%s"
+                            % (ssim_note, mean, mean_min, 100.0 * bad_share, BAD_FRAME_SSIM,
+                               " (re-do of an already playable file)" if redo_playable else "")), None
                 if lo is not None and lo < SSIM_TARGET:
                     log("   %d scattered frame(s) below %.2f (%.2f%% of the window) with a healthy "
                         "mean - treated as fades/black, not a defect"

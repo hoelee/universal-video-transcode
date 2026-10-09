@@ -4,20 +4,25 @@
 
 ## 现在在跑什么
 
-**两档都停着** —— 2026-10-09 11:30 业主叫停，先修 bug 再重启；进程已按 PID 全部清掉，GPU encoder 0 %。
-**重启前先读「第 10 个 bug：MemoryError」和「8 个 `.new.mp4` 残留」两节**，并先腾内存。
-
-原设计：两个 HEVC 档在跑，各自独立的锁（`run-x265.lock` / `run-nvenc.lock`；x265 = E 核，nvenc = GPU ASIC，互不争抢）。
-
-**它们不在 Hermes 的进程管理里** → `process_manage` 看不到，也没有退出通知：只能看日志、按 PID 杀。
+**只有 x265 一档在跑**（2026-10-09 20:51:41 起，单档启动器 `run/relaunch_x265.sh`）。
+**nvenc 档故意不启动** —— GPU 被 TubeSync 的 58 个文件修复批次占着（20:36 起，与铁律一致：同一颗编码器不能两个任务）。
 
 ```bash
-# 断点续跑（幂等：已转好的自动跳过，失败项文件未动，下一轮自动重做），每档最多重试 8 次
-bash /d/tmp/xcode/relaunch_tiers.sh
-
-# 看进度
-tail -f /d/tmp/xcode/run_x265.log /d/tmp/xcode/run_nvenc.log
+# 只起 x265（E 核，纯 CPU）—— 仓库源 run/relaunch_x265.sh 拷到 /d/tmp/xcode/ 再跑
+powershell -NoProfile -Command 'Start-Process -FilePath "C:\Program Files\Git\bin\bash.exe" -ArgumentList "D:/tmp/xcode/relaunch_x265.sh" -WindowStyle Hidden'
+# ⚠ 参数必须只有脚本路径；写成 -ArgumentList "-lc","bash <脚本>" 会起一个交互式 bash，什么都不跑
+tail -f /d/tmp/xcode/run_x265.log
 ```
+
+### 2026-10-09 16:51:58：两档是**整机重启**停的，不是 bug
+
+（两档都不在 Hermes 的进程管理里 → `process_manage` 看不到，也没有退出通知：只能看日志，按 PID 杀。）
+`LastBootUpTime = 2026-10-09 16:51:58`；x265 日志停在 16:50:42（404/589）、nvenc 停在 16:51:30
+（308/589）。11:48 由 relauncher 重新拉起、跑到重启为止。锁文件里那两个 PID（23792 / 50128）已是死号 ——
+`transcode.Lock` 是**过期感知**的（age > 300 s 且 pid 已死即接管），不需要手工清锁。
+
+重启后内存正常：物理空闲 12.9–13 GB、提交 50.3/55.9 GB（11:19 那次 MemoryError 时是 96.5%）。
+⚠ 但提交上限从 79.6 GB 缩到 55.9 GB：D: 已 92% 满，pagefile 长不上去。
 
 ### 为什么改成"脱管"启动 —— 10:37 那次全停的教训（第 9 个 bug）
 

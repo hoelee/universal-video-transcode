@@ -221,7 +221,7 @@ def _sha_remote(path, label="remote", tries=3):
                     h.update(b)
                     n += len(b)
             return h.hexdigest(), n
-        except OSError as e:
+        except (OSError, MemoryError) as e:
             last = e
             log("   ! %s read attempt %d failed: %s" % (label, attempt, e))
             time.sleep(5 * attempt)
@@ -263,7 +263,7 @@ def copy_remote_to_local(remote, local, expect_size=None, tries=5):
                     raise IOError("staged source hash mismatch (local %s.. != share %s..)"
                                   % (a[:12], b[:12]))
             return n
-        except OSError as e:
+        except (OSError, MemoryError) as e:
             log("   ! source copy attempt %d/%d failed: %s" % (attempt, tries, e))
             time.sleep(15 * attempt)
     raise IOError("could not copy source off the share after %d attempts" % tries)
@@ -296,12 +296,12 @@ def copy_local_to_remote(local, remote_tmp, tries=4):
                 fo.flush()
                 os.fsync(fo.fileno())
             return True
-        except OSError as e:
+        except (OSError, MemoryError) as e:
             log("   ! upload attempt %d/%d failed after %.0f MB: %s" % (
                 attempt, tries, written / 1e6, e))
             try:
                 os.remove(remote_tmp)
-            except OSError:
+            except (OSError, MemoryError):
                 pass
             time.sleep(20 * attempt)
     return False
@@ -760,7 +760,7 @@ def process(src, args, dest=None, origin=None):
             log("   ! %s (upload %d) - retrying" % (last, up))
             try:
                 os.remove(remote_tmp)
-            except OSError:
+            except (OSError, MemoryError):
                 pass
             time.sleep(10 * up)
         else:
@@ -917,6 +917,20 @@ def main():
                 status, extra = process(f, args, dest=args.dest or dst_path_for(f), origin=origin)
             except Exception as e:
                 status, extra = "FAIL %s: %s" % (type(e).__name__, e), None
+                # Any failure raised out of process() may leave the staged upload target on the
+                # share. Measured 2026-10-09: the host ran out of memory/commit while installing
+                # the largest output of the batch, `MemoryError` came out of a Dokan write, and the
+                # complete 493 MB `.new.mp4` stayed next to the live file (8 such orphans had piled
+                # up). Delete it unconditionally - a metadata check on this share can serve a stale
+                # answer, so "not found" is the only outcome that is ignored.
+                try:
+                    staged = (args.dest or dst_path_for(f)) + ".new.mp4"
+                    os.remove(staged)
+                    log("   ! removed the orphaned staging file %s" % staged)
+                except FileNotFoundError:
+                    pass
+                except (OSError, MemoryError) as ex:
+                    log("   ! could not remove the staging file: %s" % ex)
             el = time.time() - t0
             if status == "ok":
                 stats["ok"] += 1

@@ -1,10 +1,13 @@
-# STATE — 樊登读书会媒体库转码（2026-10-08 10:50 更新）
+# STATE — 樊登读书会媒体库转码（2026-10-09 11:40 更新）
 
 给下一个会话的交接。**权威运行器：`scripts/library_run.py`**（不要再恢复旧的 `hevc_lib.py`）。
 
 ## 现在在跑什么
 
-两个 HEVC 档在跑，各自独立的锁（`run-x265.lock` / `run-nvenc.lock`；x265 = E 核，nvenc = GPU ASIC，互不争抢）。
+**两档都停着** —— 2026-10-09 11:30 业主叫停，先修 bug 再重启；进程已按 PID 全部清掉，GPU encoder 0 %。
+**重启前先读「第 10 个 bug：MemoryError」和「8 个 `.new.mp4` 残留」两节**，并先腾内存。
+
+原设计：两个 HEVC 档在跑，各自独立的锁（`run-x265.lock` / `run-nvenc.lock`；x265 = E 核，nvenc = GPU ASIC，互不争抢）。
 
 **它们不在 Hermes 的进程管理里** → `process_manage` 看不到，也没有退出通知：只能看日志、按 PID 杀。
 
@@ -111,6 +114,43 @@ python scripts/library_run.py --tier x265 --limit 3 --keep-local
 # 分档预览
 python scripts/library_run.py --dry-run --limit 20
 ```
+
+## 第 10 个 bug：MemoryError 会在共享盘上留孤儿（2026-10-09）
+
+现象：11:19:31 与 11:19:37 连续两次 `!! FAIL MemoryError:`（消息空白），两次相隔 6 秒 ——
+一次是《崇祯传》**装盘**（写 493 MB 到 RaiDrive），一次是下一项**读源**。
+
+根因是**整机内存/提交额度耗尽**，不是文件问题：
+
+```
+物理可用 0.0 GB / 48 GB         已提交 76.8 GB / 上限 79.6 GB（96.5 %）
+pagefile d: 初始 8 GB / 上限 32 GB   —— 但 D: 只剩 19 GB（97 % 满），长不上去
+大户：Chrome ≈4 GB、Hermes ≈3.7 GB（3 个进程）、upscayl 1.17 GB、whisper-server 0.83 GB、Discord 0.76 GB
+```
+
+`copy_*` / `_sha_remote` 当时只 `except OSError`，**而 `MemoryError` 不是 OSError** → 直接冒到
+per-item 兜底；删半截 `remote_tmp` 的清理写在 `except OSError` 里 → **半截/完整的 `.new.mp4` 留在共享盘上**。
+
+已修（本轮，`scripts/library_run.py`）：
+1. `_sha_remote` / `copy_remote_to_local` / `copy_local_to_remote` 的 `except OSError` → `except (OSError, MemoryError)`（瞬时抖动变重试，不是 FAIL）；
+2. `copy_local_to_remote` 内的清理、读回不符时的清理同样放宽；
+3. **per-item 兜底加了无条件删除 `<dest>.new.mp4`**（用 `os.remove` + 忽略 `FileNotFoundError`，**不用** `os.path.exists`，因为该共享盘的元数据可能是陈旧的）。
+
+实测（注入 MemoryError）：上传路径不再抛异常、半截文件被删；读源路径重试后抛干净的 `IOError`；
+`_sha_remote` 重试 2 次后抛出。
+
+**内存仍是硬前提**：物理可用 0 GB / 提交 96.5 % 时重启，第一项照样会 FAIL（现在至少不留残留）。
+重启前建议：关掉 upscayl / 多余 Chrome 标签 / Discord 腾出 5-6 GB；pagefile 上限别放在 97 % 满的 D:。
+
+## 8 个 `.new.mp4` 残留（2026-10-09 11:35 逐个探过）
+
+原档都在，没丢东西。7 个是**半截前缀**（内容早停 → 没用，删掉让下一轮重做）；
+**只有一个是完整的、可以救回来**：
+
+| 文件 | 暂存 | 判定 |
+|---|---|---|
+| 2022年/0115《崇祯传》 | 493 MB | ✅ **完整**（3616.8 s 与源一致、内容到 3609 s）→ 校验后可改名安装 |
+| 0622人生海海 / » 0819 李白 / 0527 洪业 / 0807东京传 / 20190601被管教的勇气 / 1230 不安的哲学 / 0511原生家庭 | 8 MB–165 MB | ❌ 半截，删 |
 
 ## 红线（用户明确要求过）
 

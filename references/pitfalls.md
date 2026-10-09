@@ -27,3 +27,15 @@
 - **Unicode paths**: on Windows, drive ffmpeg from Python `subprocess` with an argv list. MSYS
   bash cannot hand a Chinese filename to native `ffmpeg.exe` even when `ls` shows it.
 - **`-hwaccel cuda` alone may still software-decode VP9**; `-c:v vp9_cuvid` forces NVDEC.
+
+- **A `MemoryError` out of a share write is not an edge case - it orphans the staged file.**
+  Measured 2026-10-09 11:19: the host hit **0 GB physical free and 76.8 GB of a 79.6 GB commit
+  limit** while both tiers ran (Chrome ~4 GB, Hermes ~3.7 GB, upscayl 1.2 GB, whisper-server
+  0.8 GB, Discord 0.8 GB; the pagefile is capped at 32 GB on a **97 %-full D:** so it cannot grow).
+  The Dokan write of the batch's largest output raised `MemoryError` - and `except OSError` does
+  not catch that, so the item was logged `!! FAIL MemoryError:` with an **empty message** and the
+  *complete* 493 MB `<live>.new.mp4` stayed on the share. Eight such orphans had piled up (7 of
+  them truncated prefixes from earlier aborted uploads).
+  Rule: treat `MemoryError` as a sibling of `OSError` in **every** share helper, and have the
+  per-item handler delete `<dest>.new.mp4` **unconditionally** - never gate that delete on
+  `os.path.exists()`, whose answer on this share can be stale.

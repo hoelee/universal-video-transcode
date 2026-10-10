@@ -115,6 +115,45 @@ def disp(p):
         return p
 
 
+# ---- owner gate policy (2026-10-10) -----------------------------------------------------------
+# Two settings, both owner decisions, kept OUT of the code so they can be changed without touching
+# the pipeline:
+#
+#  * accept  - items for which the FRAME-SHARE test is the verdict and the mean bar is only a
+#              warning. The bar was splitting a continuum rather than separating defects: on
+#              2026-10-10 eight items failed by 0.2-1.7 thousandths of mean while keeping
+#              0.20-0.93 % of frames below the floor, and only one of them (0912 洞见, 1.33 %)
+#              actually tripped the frame-share test that is documented as the real defect test.
+#              An item that fails the frame-share test is refused even when listed here.
+#  * park    - {item: failed quality ROUNDS}. A round is an initial attempt plus its quality+2
+#              retry. At PARK_AFTER rounds the item is skipped instead of re-encoded: without this
+#              the same eight items burned ~3.3 GPU-hours every pass, forever, and never converted.
+POLICY = os.path.join(WORK, "gate_policy.json")
+PARK_AFTER = 2
+
+
+def load_policy():
+    """{"accept": set(disp keys), "park": {disp key: failed rounds}} - missing file means neither."""
+    try:
+        with open(POLICY, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return {"accept": set(d.get("accept") or []), "park": dict(d.get("park") or {})}
+    except (OSError, ValueError):
+        return {"accept": set(), "park": {}}
+
+
+def save_policy(p):
+    try:
+        with open(POLICY, "w", encoding="utf-8") as fh:
+            json.dump({"accept": sorted(p["accept"]), "park": p["park"]}, fh,
+                      ensure_ascii=False, indent=1)
+    except OSError as e:
+        log("   ! could not save %s: %s" % (POLICY, e))
+
+
+POLICY_CACHE = load_policy()
+
+
 def probe(p, tries=3):
     """T.probe with retries: this share times a probe out (measured: 120 s for a 30 MB read), and
     one hiccup must not fail an item that is otherwise fine. The per-item try/except in the main
@@ -710,7 +749,18 @@ def process(src, args, dest=None, origin=None):
                 # actually catches a defect.
                 bad_share = (sstat.get("below", 0) / float(nfr)) if nfr else 0.0
                 mean_min = SSIM_MEAN_MIN_REDO if redo_playable else SSIM_MEAN_MIN
-                systematic = (mean is not None and mean < mean_min) or bad_share > MAX_BAD_SHARE
+                # Owner decision 2026-10-10: for an item on the policy's accept list the FRAME-SHARE
+                # test is the verdict (that is the test documented as the one that actually catches
+                # a defect) and a mean under the bar is recorded, not enforced. An item that fails
+                # the frame-share test is refused even when listed, and every other item is judged
+                # exactly as before.
+                approved = disp(src) in POLICY_CACHE["accept"]
+                systematic = bad_share > MAX_BAD_SHARE or (
+                    mean is not None and mean < mean_min and not approved)
+                if approved and mean is not None and mean < mean_min and bad_share <= MAX_BAD_SHARE:
+                    log("   accepted on the frame-share test (%.2f%% below %.2f, bar %.2f%%) for an "
+                        "owner-approved item; mean %.4f under the %.3f bar recorded, not enforced"
+                        % (100.0 * bad_share, BAD_FRAME_SSIM, 100.0 * MAX_BAD_SHARE, mean, mean_min))
                 if systematic:
                     if q_off < QUALITY_STEPS and (attempt == 1):
                         q_off = QUALITY_STEPS
@@ -896,6 +946,7 @@ def main():
         log("=== plan: %s" % plan)
         return
 
+    POLICY_CACHE.update(load_policy())      # pick up an edited gate_policy.json between runs
     with T.Lock(lockf):
         stats = {"ok": 0, "skip": 0, "fail": 0}
         ledger = open(LEDGER, "a", encoding="utf-8")
@@ -907,30 +958,39 @@ def main():
             log("--- %d/%d %s" % (i, len(files), disp(f)))
             t0 = time.time()
             origin = None
-            if args.origin_root:
+            parked = POLICY_CACHE["park"].get(disp(f), 0)
+            if parked >= PARK_AFTER:
+                # Parked: it has failed this many quality rounds already and every further attempt
+                # costs an encode (plus its quality+2 retry) without ever converting. Recorded as a
+                # SKIP so it is visible, not silent; clear its entry in gate_policy.json to retry.
+                status = ("SKIP parked: %d quality round(s) already failed - not re-encoding "
+                          "(clear the entry in %s to retry)" % (parked, os.path.basename(POLICY)))
+                extra = None
+            else:
+                if args.origin_root:
+                    try:
+                        cand = os.path.join(args.origin_root, os.path.relpath(f, ROOT))
+                    except ValueError:
+                        cand = None
+                    origin = cand if cand and os.path.exists(cand) else None
                 try:
-                    cand = os.path.join(args.origin_root, os.path.relpath(f, ROOT))
-                except ValueError:
-                    cand = None
-                origin = cand if cand and os.path.exists(cand) else None
-            try:
-                status, extra = process(f, args, dest=args.dest or dst_path_for(f), origin=origin)
-            except Exception as e:
-                status, extra = "FAIL %s: %s" % (type(e).__name__, e), None
-                # Any failure raised out of process() may leave the staged upload target on the
-                # share. Measured 2026-10-09: the host ran out of memory/commit while installing
-                # the largest output of the batch, `MemoryError` came out of a Dokan write, and the
-                # complete 493 MB `.new.mp4` stayed next to the live file (8 such orphans had piled
-                # up). Delete it unconditionally - a metadata check on this share can serve a stale
-                # answer, so "not found" is the only outcome that is ignored.
-                try:
-                    staged = (args.dest or dst_path_for(f)) + ".new.mp4"
-                    os.remove(staged)
-                    log("   ! removed the orphaned staging file %s" % staged)
-                except FileNotFoundError:
-                    pass
-                except (OSError, MemoryError) as ex:
-                    log("   ! could not remove the staging file: %s" % ex)
+                    status, extra = process(f, args, dest=args.dest or dst_path_for(f), origin=origin)
+                except Exception as e:
+                    status, extra = "FAIL %s: %s" % (type(e).__name__, e), None
+                    # Any failure raised out of process() may leave the staged upload target on the
+                    # share. Measured 2026-10-09: the host ran out of memory/commit while installing
+                    # the largest output of the batch, `MemoryError` came out of a Dokan write, and
+                    # the complete 493 MB `.new.mp4` stayed next to the live file (8 such orphans had
+                    # piled up). Delete it unconditionally - a metadata check on this share can serve
+                    # a stale answer, so "not found" is the only outcome that is ignored.
+                    try:
+                        staged = (args.dest or dst_path_for(f)) + ".new.mp4"
+                        os.remove(staged)
+                        log("   ! removed the orphaned staging file %s" % staged)
+                    except FileNotFoundError:
+                        pass
+                    except (OSError, MemoryError) as ex:
+                        log("   ! could not remove the staging file: %s" % ex)
             el = time.time() - t0
             if status == "ok":
                 stats["ok"] += 1
@@ -943,6 +1003,17 @@ def main():
             else:
                 stats["fail"] += 1
                 log("   !! %s" % status)
+                if status.startswith("FAIL quality"):
+                    # Count the round so a repeat offender stops consuming the encoder. The counter
+                    # is persisted: without it every pass re-encoded the same eight items forever.
+                    k = disp(f)
+                    POLICY_CACHE["park"][k] = POLICY_CACHE["park"].get(k, 0) + 1
+                    save_policy(POLICY_CACHE)
+                    log("   -> quality round %d/%d failed for this item%s"
+                        % (POLICY_CACHE["park"][k], PARK_AFTER,
+                           (" - PARKED, skipped from now on (clear its entry in %s)"
+                            % os.path.basename(POLICY))
+                           if POLICY_CACHE["park"][k] >= PARK_AFTER else ""))
             ledger.write(json.dumps({"t": time.strftime("%Y-%m-%dT%H:%M:%S"),
                                      "path": disp(f), "status": status,
                                      "secs": round(el, 1), "extra": extra},

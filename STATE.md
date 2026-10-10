@@ -115,13 +115,13 @@ live = HEVC hvc1 **且**音轨是 AAC（真能播）**且**本次是从快照原
 4. **安装只用 ffprobe 元数据复核** → RaiDrive 返回**缓存属性**，rename 没落地也说成功（实测"ok 1085→478 MB"而线上仍是原档）→ 改**安装后回读哈希**。
 5. **源拷贝只校验字节数** → 加 **SHA-256 比对共享盘副本**（长度对内容错是真风险）。
 6. **probe 单次失败即判文件失败** → 加**重试 3 次**。
-7. **看门狗用 stderr 管道**（本轮最贵的 bug）→ ffmpeg `-stats` 每 0.5 s 一行，64 KB 管道几分钟塞满 → ffmpeg 阻塞在 write() → 输出不增长 → 看门狗**误杀好编码**（整夜 ~270 杀、只转成 24 个、GPU 0%）。修：**stderr 写文件**，阈值 5→15 分钟。自检脚本 `D:\dev\hoelee-tubesync-management\cache\watchdog_selfcheck.py`。
+7. **看门狗用 stderr 管道**（本轮最贵的 bug）→ ffmpeg `-stats` 每 0.5 s 一行，64 KB 管道几分钟塞满 → ffmpeg 阻塞在 write() → 输出不增长 → 看门狗**误杀好编码**（整夜 ~270 杀、只转成 24 个、GPU 0%）。修：**stderr 写文件**，阈值 5→15 分钟。自检脚本 `D:\dev\hoelee-resource-transcode\cache\watchdog_selfcheck.py`。
 8. 看门狗**保留**（它要防的是真实场景：用户更新 NVIDIA 驱动会把在跑的 NVENC 冻死 1.5 小时且不报错）。
 9. **Hermes 后台进程会随会话一起被杀** —— 两个档在 10:37 同时死在编码中，日志里没有 `PASS-DONE`；改脱管启动（见上）。
 
 ## 未完成 / 待办
 
-- [ ] 两档跑完 → **全库落地审计**：`D:\dev\hoelee-tubesync-management\cache\install_audit.py`（核对线上文件真实大小 + 编码器；曾一次抓到"报告成功没落地"）+ `copy_land_check.py`（copy 档用音轨 aac/mp3 判定）。
+- [ ] 两档跑完 → **全库落地审计**：`D:\dev\hoelee-resource-transcode\cache\install_audit.py`（核对线上文件真实大小 + 编码器；曾一次抓到"报告成功没落地"）+ `copy_land_check.py`（copy 档用音轨 aac/mp3 判定）。
 - [ ] 失败项：无需清单，新一轮自动重做（失败时文件原样）。
 - [ ] `2022年/0723 《走出强迫症》/走出强迫症.mp4` 用新下载（`D:\Download\0723走出强迫症.mp4`，618,696,954 B）已转好装好（450,502,893 B，HEVC+AAC，SSIM min 0.997，时长 3399.81 s）✓。**快照里那份仍是坏的**（618,697,011 B，moov 缺失）→ 待定：是否用干净副本替换快照里的坏档，以免将来"从原档重转"踩坑。
 - [ ] 目标文件夹里曾出现一个 0 字节的 `0723走出强迫症.mp4`（现已不在）—— 若是用户自建请告知命名约定。

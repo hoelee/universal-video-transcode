@@ -75,7 +75,7 @@ structural gate and confirm on the Apple device.
 
 ## 6. Related work
 
-- **`hoelee-tubesync-management`** — the TubeSync archive this tool was extracted from. It
+- **`hoelee-resource-transcode`** — the TubeSync archive this tool was extracted from. It
   owns the DB-driven pipeline (`tsconv.py` / `tsfix.py`) and the deeper frame-timing
   forensics. `tsconv.flat_timing()` is that repo's copy of the detector: **keep the two in
   step**, and note that the missing-`ctts` shape was once missed by three duplicated copies

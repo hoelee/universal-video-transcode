@@ -121,5 +121,5 @@ Why this is safe to schedule:
 Before pointing it at a live library, `--dry-run` prints the plan and encodes nothing.
 
 > **TubeSync specifically:** use that project's own DB-driven pipeline
-> (`hoelee-tubesync-management`: `tsconv.py` / `tsfix.py`) — it also updates the database
+> (`hoelee-resource-transcode`: `tsconv.py` / `tsfix.py`) — it also updates the database
 > rows. This tool is for everything outside it.

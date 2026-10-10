@@ -679,7 +679,18 @@ def process(src, args, dest=None, origin=None):
     vbps = src_video_bps(src, info)
     bpp = bpp_of(info, vbps)
     tier = tier_for_bpp(bpp)
-    if args.tier and args.tier != tier:
+    forced = getattr(args, "force_tier", None)
+    if forced:
+        # An explicit override, but never a silent one, and never one that breaks playability:
+        #   * copy on a VP9/AV1 source would ship an MP4 whose video iOS cannot decode;
+        #   * a re-encode of a file that already plays (HEVC hvc1) is the `--overwrite` decision.
+        if forced == "copy" and info["vcodec"] not in ("h264", "avc1", "hevc"):
+            return "SKIP force-tier copy refused: %s source cannot play on iOS" % info["vcodec"], None
+        if forced != "copy" and info["vcodec"] == "hevc" and info["tag"] == "hvc1"                 and not T.unusable_timeline(info, src)[0]:
+            return "SKIP force-tier re-encode refused: already HEVC hvc1 (use --overwrite)", None
+        log("   force-tier %s (bpp rule said %s)" % (forced, tier))
+        tier = forced
+    elif args.tier and args.tier != tier:
         return "SKIP classified %s (run wants %s)" % (tier, args.tier), None
     expect_vc = "hevc" if tier != "copy" else (info["vcodec"] or "h264")
     log("   tier=%s bpp=%.4f src_video=%.0f kbps %sx%s@%.0f %s" % (
@@ -878,6 +889,13 @@ def main():
     ap.add_argument("--pools", type=int, default=X265_POOLS, help="x265 threads (match the E-core mask)")
     ap.add_argument("--tier", choices=["copy", "nvenc", "x265"],
                     help="only touch files classified into this tier (run tiers separately)")
+    ap.add_argument("--force-tier", choices=["copy", "nvenc", "x265"], default=None,
+                    help="override the bpp classification for this run instead of skipping the "
+                         "file (the control plane needs it: an owner decision can say a LEAN "
+                         "source is still worth re-encoding, and `--tier x265` would otherwise "
+                         "refuse every lean file it disagrees about). Two guards stay in place: "
+                         "copy is refused for a source iOS cannot play (VP9/AV1), and a re-encode "
+                         "is refused for a file that is already HEVC hvc1.")
     ap.add_argument("--origin-root", default=None,
                     help="tree holding the PRE-CONVERSION originals (e.g. a snapshot); a file that "
                          "is already HEVC and BIGGER than its original is re-done from that "

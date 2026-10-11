@@ -60,6 +60,15 @@ SSIM_WINDOW = 60         # seconds sampled for the SSIM gate
 BAD_FRAME_SSIM = 0.85    # a frame this far below the source is 'bad' for the share test
 MAX_BAD_SHARE = 0.01     # ... and more than this share of them means a systematic defect, not fades
 FLAT_LUMA_STD = 3.0      # a source frame flatter than this: SSIM on it means nothing
+ALIGN_FINE = 6           # fine offset search STEP: 1 frame, over +-ALIGN_FINE frames. A cfr
+                         # duplicate (inserted wherever the encoder dropped a frame) displaces the
+                         # whole window by EXACTLY one frame - measured 2026-10-11 on two installed
+                         # outputs: 1499/1500 and 1495/1500 frames needed off=-1, which a step-10
+                         # sweep cannot see (it cost 1.5-1.7 mean points and refused 14 healthy
+                         # encodes in 9.6 h).
+ALIGN_PERFRAME = 2       # last resort: score every frame against the best of its +-N neighbours
+                         # (the TubeSync engine's CONTENT_SHIFT discriminator), for a window whose
+                         # displacement varies instead of being one constant shift.
 
 
 def _flat_frames(raw_path, n, w=480, h=270, thresh=FLAT_LUMA_STD):
@@ -88,15 +97,30 @@ SIZE_CEIL = 1.0          # output video bitrate must not exceed the source's
 QUALITY_STEPS = 2        # on a quality-gate failure, retry with the quality raised this many
                          # steps (cq -2 / crf -2) before giving up; the retry only fires on a
                          # file the cheaper setting could not carry
-SSIM_MEAN_MIN = 0.98     # the window-mean bar for a normal encode
-SSIM_MEAN_MIN_REDO = 0.975   # ... and for a RE-DO of a file that already plays everywhere
+SSIM_MEAN_MIN = 0.995    # the window-mean bar for a normal encode (owner decision 2026-10-11).
+# Measured basis: the aligned means of healthy encodes on this library land at 0.9960-0.9978 (the
+# canary plus two x265 items); the pre-fix distribution had 41% of items below 0.995, which is
+# pessimistic - the old index pairing depressed every mean by 1.5-1.7 points.
+SSIM_MEAN_MIN_REDO = 0.990   # ... and for a RE-DO of a file that already plays everywhere
                          # (HEVC hvc1 + AAC). Owner decision 2026-10-08: measured on this library,
                          # 11 of a pass's attempts died on a mean of 0.9655-0.9795 while files with
                          # WORSE frame minima (0.33-0.90) passed - the bar was splitting a
                          # continuum, not separating defects (0718 马斯克原理 failed with 0.00% of
                          # frames below 0.85 and min 0.887). A re-do's only job is to reclaim the
                          # old settings' bloat, so it must not be stranded with the bigger file for
-                         # ever; 0.975 still rejects the two genuine stragglers (0.9655, 0.9739).
+                         # ever; 0.990 still rejects the genuine stragglers (0.9655, 0.9739).
+SSIM_MEAN_MIN_FALLBACK = 0.990   # the SECOND tier, for an item the owner has released from the first
+                         # (the accept list): the frame-share test stays the verdict that catches a
+                         # defect, but the mean is now enforced here instead of being ignored
+                         # entirely. This IS the owner's ladder from 2026-10-11 - a bar of 0.995 for
+                         # a normal encode and 0.990 once an item has been released - rather than a
+                         # hidden retry counter: after "park after 2 failed rounds" an item stops and
+                         # waits for that explicit decision.
+VMAF_OBSERVE = True      # compute VMAF inside the gate and PRINT it - never gate on it (owner
+                         # decision 2026-10-11). The evidence base is two items (aligned mean 95.85 /
+                         # 96.00, min 93.76 / 94.10 against a proposed 95/93: ~zero margin), so this
+                         # runs observe-only and accumulates the distribution the bar can be picked
+                         # from. See docs/QUALITY-POLICY-PLAN.md 2.4.
 
 
 def log(*a):
@@ -178,6 +202,9 @@ def run(cmd, timeout=86400, **kw):
 
 
 STALL_S = 900   # an encode with no output growth for this long is wedged, not slow
+# ... and the SSIM window decodes get a longer one: the trim filter writes nothing until the window
+# starts, so decoding the file's first half is legitimate silence (see ssim_vs_source).
+GATE_STALL_S = 3600
 
 
 def run_watched(cmd, watch, stall_s=STALL_S, timeout=86400):
@@ -463,12 +490,38 @@ def ssim_vs_source(src_local, out_local, info, workdir, tag, dur=SSIM_WINDOW):
     # itself saw.
     vf = ("trim=start=%.3f:end=%.3f,setpts=PTS-STARTPTS,scale=%s:flags=bilinear,format=yuv420p"
           % (start, start + dur, cmp_scale))
+    decode_err = None
     for path, dstp in ((src_local, ref), (out_local, out)):
-        r = run_watched([FFMPEG, "-y", "-v", "error", "-i", path,
-                         "-map", "0:v:0", "-an", "-vf", vf,
-                         "-fps_mode", "passthrough", "-f", "rawvideo", dstp], dstp, timeout=7200)
-        if r.returncode != 0 or not os.path.exists(dstp) or not os.path.getsize(dstp):
-            return None, None, 0, None, {}
+        # Retry once, and KEEP the reason. Measured 2026-10-11: a window decode failed outright on a
+        # 53-minute source (the run died 16.7 min in with "FAIL ssim: no frames compared" and the
+        # next attempt of the same file passed at 0.9960) - and because this path discarded the
+        # ffmpeg stderr, there was nothing to diagnose it with. The retry costs a 480x270 decode;
+        # discarding a finished encode over a transient decode does not.
+        # NB the stall window is deliberately much longer than an encode's: the trim filter writes
+        # NOTHING until the window starts, so a sequential decode of the file's first half is
+        # legitimate silence and must not be read as a wedge.
+        for attempt in (1, 2):
+            r = run_watched([FFMPEG, "-y", "-v", "error", "-i", path,
+                             "-map", "0:v:0", "-an", "-vf", vf,
+                             "-fps_mode", "passthrough", "-f", "rawvideo", dstp], dstp,
+                            stall_s=GATE_STALL_S, timeout=7200)
+            if r.returncode == 0 and os.path.exists(dstp) and os.path.getsize(dstp):
+                decode_err = None
+                break
+            decode_err = ("window decode of %s failed (rc=%s, %s): %s"
+                          % (os.path.basename(path), r.returncode,
+                             "empty output" if not (os.path.exists(dstp) and os.path.getsize(dstp))
+                             else "nonzero rc", (r.stderr or "").strip()[-500:]))
+            if attempt == 1:
+                log("   ! %s - retrying the decode once" % decode_err[:200])
+                time.sleep(5)
+        if decode_err:
+            for f in (ref, out):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+            return None, None, 0, None, {"decode_error": decode_err}
         counts.append(os.path.getsize(dstp) // (480 * 270 * 3 // 2))
     n_src, n_out = counts
     if n_src and abs(n_out - n_src) / float(n_src) > 0.01:
@@ -481,10 +534,17 @@ def ssim_vs_source(src_local, out_local, info, workdir, tag, dur=SSIM_WINDOW):
                                "(%.1f%% difference) - the CFR encode fills the source's holes, so a "
                                "frame-by-frame comparison is not applicable" % (n_src, n_out,
                                                                                100.0 * (n_out - n_src) / n_src)), {}
-    subprocess.run([FFMPEG, "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", cmp_scale,
-                    "-i", ref, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", cmp_scale, "-i", out,
-                    "-lavfi", "ssim=stats_file=ssim_%s.log" % tag, "-f", "null", "-"],
-                   capture_output=True, cwd=workdir)
+    try:
+        subprocess.run([FFMPEG, "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", cmp_scale,
+                        "-i", ref, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", cmp_scale, "-i", out,
+                        "-lavfi", "ssim=stats_file=ssim_%s.log" % tag, "-f", "null", "-"],
+                       capture_output=True, cwd=workdir, timeout=900)
+    except subprocess.TimeoutExpired:
+        # A wedged ffmpeg must not hang the item forever: without this the lane would sit on a dead
+        # filtergraph until a human noticed (measured outside the engine 2026-10-11: a stalled
+        # helper burned 4500 s of CPU over an hour and nobody was watching).
+        log("   ! ssim filter timed out after 900 s - no picture verdict from this attempt")
+        decode_err = "ssim filter timed out after 900 s"
     vals = []
     p = os.path.join(workdir, "ssim_%s.log" % tag)
     if os.path.exists(p):
@@ -511,24 +571,61 @@ def ssim_vs_source(src_local, out_local, info, workdir, tag, dur=SSIM_WINDOW):
     mean = (sum(vals) / len(vals)) if vals else None
     bad = sum(1 for v in vals if v < BAD_FRAME_SSIM)
     stats = {"below": bad, "flat": len(flat), "total": n}
+    if decode_err:
+        # carry the reason out: `process()` puts it in the FAIL message so a gate that could not run
+        # is diagnosable instead of a bare "no frames compared"
+        stats["decode_error"] = decode_err
     note = None
     # If the direct pairing looks bad, try to EXPLAIN the mismatch as a timeline offset before
     # condemning the file: a source whose timeline drifts (or had a hole earlier) makes the encode
     # lag it by a fixed number of frames, and a wrong-picture defect can NOT be fixed by any single
     # shift. Requiring a good score at some offset is therefore a sound discriminator.
-    if n and (lo is None or lo < SSIM_TARGET or mean < 0.985):
+    #
+    # Three stages, cheapest first, and the note says which one carried the verdict:
+    #   1. fine, STEP 1 over +-ALIGN_FINE - the measured failure mode (a cfr duplicate displaces the
+    #      whole window by exactly one frame; a step-10 sweep cannot see it);
+    #   2. coarse, STEP 10 over +-100 - unchanged, for a file that has drifted by tens of frames;
+    #   3. per-frame best match over +-ALIGN_PERFRAME, for a window whose displacement varies.
+    used_off = 0            # the alignment the VMAF observation below is measured at
+    if n and (lo is None or lo < SSIM_TARGET or mean is None or mean < SSIM_MEAN_MIN):
         best = None
         nf = min(n, 1200)
-        for off in range(-100, 101, 10):
-            if off == 0:
-                continue
-            mn, mm, k = _paired_ssim(ref, out, off, nf, workdir, "off%d" % abs(off))
-            if mn is not None and (best is None or mn > best[0]):
-                best = (mn, mm, k, off)
+        pid = os.getpid()          # two lanes share the stage dir: a fixed tag let them overwrite
+        for stage, offs in (("fine", range(-ALIGN_FINE, ALIGN_FINE + 1)),
+                            ("coarse", range(-100, 101, 10))):
+            for off in offs:
+                if off == 0:
+                    continue
+                mn, mm, k = _paired_ssim(ref, out, off, nf, workdir, "%d%s%d" % (pid, stage, abs(off)))
+                if mn is not None and (best is None or mn > best[0]):
+                    best = (mn, mm, k, off, stage)
+            if best and best[0] >= 0.90 and best[1] >= 0.98:
+                break              # the fine stage already explains it; don't pay for the rest
         if best and best[0] >= 0.90 and best[1] >= 0.98:
-            note = ("timeline offset of %+d frames between source and encode - pictures verified at "
-                    "that alignment (min SSIM %.4f mean %.4f)" % (best[3], best[0], best[1]))
+            # NB this is INFORMATION, not a reason to skip the verdict: it goes into stats (the
+            # caller logs it and still applies the mean / frame-share bars at these aligned
+            # numbers). The 4th return value stays reserved for the one case where a frame-by-frame
+            # comparison genuinely cannot be made (an irregular source timeline), because that is
+            # the only case where the caller must fall back to structure/decode/size alone.
+            stats["align_note"] = ("timeline offset of %+d frames between source and encode "
+                                   "(%s search) - pictures verified at that alignment"
+                                   % (best[3], best[4]))
             lo, mean, n = best[0], best[1], best[2]
+            used_off = best[3]
+        else:
+            per = _perframe_best(ref, out, nf, workdir, "%d" % pid)
+            if per and per[1] >= 0.90 and per[2] >= 0.98:
+                stats["align_note"] = ("per-frame best match (+-%d frames) - displacement varies "
+                                       "inside the window" % ALIGN_PERFRAME)
+                lo, mean, n = per[1], per[2], per[0]
+            else:
+                log("   no alignment explains the mismatch (best constant offset %s,"
+                    " per-frame best-match %s) - keeping the direct-pairing verdict"
+                    % (("min %.4f" % best[0]) if best else "none",
+                       ("min %.4f mean %.4f" % (per[1], per[2])) if per else "none"))
+    if VMAF_OBSERVE and n:
+        # An observation, never a verdict - if it cannot be computed the item is judged without it.
+        stats["vmaf"] = vmaf_of_pair(ref, out, used_off, min(n, 1200), workdir, "%d" % os.getpid())
     for f in (ref, out):
         try:
             os.remove(f)
@@ -537,38 +634,141 @@ def ssim_vs_source(src_local, out_local, info, workdir, tag, dur=SSIM_WINDOW):
     return lo, mean, n, note, stats
 
 
-def _paired_ssim(ref_raw, out_raw, off, nf, workdir, tag):
-    """SSIM of the first `nf` frames of out_raw against ref_raw starting `off` frames in."""
+def _copy_frames(src, dst, start_frame, nframes, fs=480 * 270 * 3 // 2, chunk=48):
+    """Copy `nframes` frames from `start_frame` of a raw 480x270 yuv420p file into `dst`.
+
+    Chunked on purpose: a 1200-frame slice is ~233 MB, and this host has thrown MemoryError on a
+    single read that size while the lanes were running.
+    """
+    left = nframes * fs
+    with open(src, "rb") as f, open(dst, "wb") as g:
+        f.seek(start_frame * fs)
+        while left > 0:
+            b = f.read(min(left, chunk * fs))
+            if not b:
+                break
+            g.write(b)
+            left -= len(b)
+    return nframes * fs - left
+
+
+def _ssim_series(ref_raw, out_raw, off, nf, workdir, tag):
+    """Per-frame SSIM of `out_raw` against `ref_raw` displaced by `off` frames.
+
+    BOTH directions are real. The previous version only ever advanced the *reference*
+    (`f.seek(max(0, off) * fs)`) and read the output from frame 0, so every negative offset scored
+    exactly the same as 0: the negative half of the search was a no-op, and a "verified at -100
+    frames" note in the log was really the unshifted pairing again (measured 2026-10-11).
+    A positive `off` = the reference is ahead (the output lags it); negative = the output is ahead.
+    """
     fs = 480 * 270 * 3 // 2
-    with open(ref_raw, "rb") as f:
-        f.seek(max(0, off) * fs)
-        a = f.read(nf * fs)
+    k = nf - abs(off)
+    if k < 1:
+        return []
     pa = os.path.join(workdir, "pair_a_%s.yuv" % tag)
     pb = os.path.join(workdir, "pair_b_%s.yuv" % tag)
-    with open(pa, "wb") as f:
-        f.write(a)
-    with open(out_raw, "rb") as f:
-        b = f.read(nf * fs)
-    with open(pb, "wb") as f:
-        f.write(b)
-    vals = []
+    _copy_frames(ref_raw, pa, max(0, off), k, fs)
+    _copy_frames(out_raw, pb, max(0, -off), k, fs)
     log = os.path.join(workdir, "pair_%s.log" % tag)
-    subprocess.run([FFMPEG, "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", "480:270",
-                    "-i", pa, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", "480:270", "-i", pb,
-                    "-lavfi", "ssim=stats_file=%s" % os.path.basename(log), "-f", "null", "-"],
-                   capture_output=True, cwd=workdir)
+    try:
+        subprocess.run([FFMPEG, "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", "480:270",
+                        "-i", pa, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", "480:270", "-i", pb,
+                        "-lavfi", "ssim=stats_file=%s" % os.path.basename(log), "-f", "null", "-"],
+                       capture_output=True, cwd=workdir, timeout=900)
+    except subprocess.TimeoutExpired:
+        # one offset that cannot be scored is data we do not have - never a hang and never a verdict
+        log("   ! pair ssim at off %+d timed out after 900 s - skipping this offset" % off)
+        for f in (pa, pb):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        return []
+    vals = []
     if os.path.exists(log):
         with open(log, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 m = re.search(r"All:([0-9.]+)", line)
                 if m:
                     vals.append(float(m.group(1)))
-    for f in (pa, pb):
+    for f in (pa, pb, log):
+        # the stats log goes too: the alignment search writes one per offset (13 for the fine stage
+        # alone) and nothing prunes them, so a full pass over the library would leave tens of
+        # thousands of 80 KB files behind. The verdict is already in the run log.
         try:
             os.remove(f)
         except OSError:
             pass
+    return vals
+
+
+def vmaf_of_pair(ref_raw, out_raw, off, nf, workdir, tag):
+    """VMAF of the output window against the source window at the alignment the SSIM search found.
+
+    Observe-only (see VMAF_OBSERVE). libvmaf takes the DISTORTED stream first and the reference
+    second; both sides are sliced out of the window's raw frames so the number is measured at exactly
+    the alignment the SSIM verdict used - VMAF on misaligned frames reads 75-87 for a healthy encode
+    (measured), so measuring at offset 0 unconditionally would produce noise, not evidence.
+    Never raises into the gate: a VMAF that cannot be computed is an absent observation.
+    """
+    fs = 480 * 270 * 3 // 2
+    k = nf - abs(off)
+    if k < 1:
+        return None
+    pa = os.path.join(workdir, "vmaf_a_%s.yuv" % tag)      # reference (source)
+    pb = os.path.join(workdir, "vmaf_b_%s.yuv" % tag)      # distorted (the encode)
+    log = os.path.join(workdir, "vmaf_%s.json" % tag)
+    raw = ["-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", "480:270", "-framerate", "25"]
+    try:
+        _copy_frames(ref_raw, pa, max(0, off), k, fs)
+        _copy_frames(out_raw, pb, max(0, -off), k, fs)
+        subprocess.run([FFMPEG, "-y", "-v", "error"] + raw + ["-i", pb] + raw + ["-i", pa,
+                        "-lavfi", "libvmaf=log_path=%s:log_fmt=json" % os.path.basename(log),
+                        "-f", "null", "-"], capture_output=True, cwd=workdir, timeout=900)
+        with open(log, encoding="utf-8", errors="replace") as fh:
+            m = json.load(fh)["pooled_metrics"]["vmaf"]
+        return {"mean": float(m["mean"]), "min": float(m["min"]), "frames": k}
+        # SCALE MATTERS: this is a 480x270 comparison because that is the window the SSIM gate
+        # already decoded. Measured on one item (危机领导力, aligned): 480p reads mean 98.27 /
+        # min 96.97 where the SAME window at native resolution reads 95.85 / 93.76 - i.e. +2.4 /
+        # +3.2 points. So the number is reported as `vmaf480`, and a bar picked from it is a 480p
+        # bar. Native-scale calibration is the separate one-off run (plan 2.4, item 2).
+    except Exception as e:                                  # noqa: BLE001
+        log("   vmaf observation unavailable: %s" % str(e)[:160])
+        return None
+    finally:
+        for f in (pa, pb, log):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+
+def _paired_ssim(ref_raw, out_raw, off, nf, workdir, tag):
+    """(min, mean, frames) for one constant offset - see `_ssim_series` for the sign convention."""
+    vals = _ssim_series(ref_raw, out_raw, off, nf, workdir, tag)
     return (min(vals), sum(vals) / len(vals), len(vals)) if vals else (None, None, 0)
+
+
+def _perframe_best(ref_raw, out_raw, nf, workdir, tag):
+    """(frames, min, mean) where each frame scores against the best of its +-ALIGN_PERFRAME
+    neighbours.
+
+    For a window whose displacement is not one constant shift. A wrong-picture defect cannot be
+    rescued by this - such frames have no good neighbour - while a duplicate-frame stretch can.
+    """
+    per = {}
+    for off in range(-ALIGN_PERFRAME, ALIGN_PERFRAME + 1):
+        vals = _ssim_series(ref_raw, out_raw, off, nf, workdir, "%sp%+d" % (tag, off))
+        base = max(0, off)
+        for i, v in enumerate(vals):
+            j = base + i
+            if v > per.get(j, -1.0):
+                per[j] = v
+    if not per:
+        return None
+    s = [per[k] for k in sorted(per)]
+    return len(s), min(s), sum(s) / len(s)
 
 
 def pin_to_e_cores():
@@ -736,9 +936,9 @@ def process(src, args, dest=None, origin=None):
                 obps = out_video_bps(loc_out, info["dur"])
                 growth = 100.0 * obps / vbps if vbps else 0.0
                 if irreg:
-                    # Either the source's timeline has holes (frame pairing is meaningless) or the
-                    # mismatch was explained by a fixed timeline offset. Both are reported, not
-                    # silently swallowed, and the structural/decode/size gates still apply below.
+                    # The source's timeline is irregular: frame pairing is meaningless, so there is
+                    # no picture verdict to apply. Reported, not swallowed, and the other gates
+                    # (structure, full decode, frame count, size ceiling) still carry the item.
                     ssim_note = irreg
                     log("   NOTE: %s" % ssim_note)
                     if vbps and obps > vbps * SIZE_CEIL:
@@ -746,9 +946,23 @@ def process(src, args, dest=None, origin=None):
                             obps / 1000, vbps / 1000, growth), None
                     break
                 if not nfr:
-                    return "FAIL ssim: no frames compared", None
+                    derr = (sstat or {}).get("decode_error")
+                    return "FAIL ssim: no frames compared%s" % (
+                        " - " + derr[:300] if derr else ""), None
                 ssim_note = "ssim min %.4f mean %.4f (%d frames)%s" % (
                     lo, mean, nfr, "" if not q_off else " at quality+%d" % q_off)
+                if (sstat or {}).get("align_note"):
+                    # Information only - the bars below are applied AT THESE ALIGNED NUMBERS. This
+                    # used to arrive in the `irreg` slot and therefore skip the whole picture verdict
+                    # (measured 2026-10-11: the canary and two x265 items were accepted that way
+                    # with the mean bar never enforced at all).
+                    log("   NOTE: %s" % sstat["align_note"])
+                    ssim_note += " ; " + sstat["align_note"]
+                if (sstat or {}).get("vmaf"):
+                    v = sstat["vmaf"]
+                    log("   vmaf480 (observe-only, no verdict): mean %.2f min %.2f (%d frames)"
+                        % (v["mean"], v["min"], v["frames"]))
+                    ssim_note += " ; vmaf480 mean %.2f min %.2f (observe-only)" % (v["mean"], v["min"])
                 # The verdict is a DEFECT SHAPE, not a single frame. A systematic mismatch drops the
                 # mean and puts a real share of frames below the floor; a handful of scattered low
                 # frames at a healthy mean is what fades, black frames and hard cuts do to SSIM.
@@ -760,18 +974,17 @@ def process(src, args, dest=None, origin=None):
                 # actually catches a defect.
                 bad_share = (sstat.get("below", 0) / float(nfr)) if nfr else 0.0
                 mean_min = SSIM_MEAN_MIN_REDO if redo_playable else SSIM_MEAN_MIN
-                # Owner decision 2026-10-10: for an item on the policy's accept list the FRAME-SHARE
-                # test is the verdict (that is the test documented as the one that actually catches
-                # a defect) and a mean under the bar is recorded, not enforced. An item that fails
-                # the frame-share test is refused even when listed, and every other item is judged
-                # exactly as before.
+                # Owner decision 2026-10-11: the accept list releases an item from the FIRST tier to
+                # the SECOND (a mean bar of 0.990) - it used to switch the mean test off entirely, so
+                # an approved file could be filed at any mean whatsoever. The frame-share test is
+                # still the verdict that actually catches a defect, and it applies to every item.
                 approved = disp(src) in POLICY_CACHE["accept"]
+                if approved and mean_min > SSIM_MEAN_MIN_FALLBACK:
+                    log("   owner-released item: mean bar is the second tier %.3f (normal bar %.3f)"
+                        % (SSIM_MEAN_MIN_FALLBACK, mean_min))
+                    mean_min = SSIM_MEAN_MIN_FALLBACK
                 systematic = bad_share > MAX_BAD_SHARE or (
-                    mean is not None and mean < mean_min and not approved)
-                if approved and mean is not None and mean < mean_min and bad_share <= MAX_BAD_SHARE:
-                    log("   accepted on the frame-share test (%.2f%% below %.2f, bar %.2f%%) for an "
-                        "owner-approved item; mean %.4f under the %.3f bar recorded, not enforced"
-                        % (100.0 * bad_share, BAD_FRAME_SSIM, 100.0 * MAX_BAD_SHARE, mean, mean_min))
+                    mean is not None and mean < mean_min)
                 if systematic:
                     if q_off < QUALITY_STEPS and (attempt == 1):
                         q_off = QUALITY_STEPS

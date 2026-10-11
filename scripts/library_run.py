@@ -172,15 +172,29 @@ def load_policy():
 
 
 def save_policy(p):
+    """Persist ONLY the counters this process bumped, merged into the file as it is on disk now.
+
+    Measured 2026-10-11: save_policy used to write its whole in-memory snapshot, so an edit made while
+    an engine was running - a `park` entry deleted to release an item for a lower-crf retry, or an
+    `accept` entry added - was silently reverted by the next failure of any OTHER item. The released
+    item was then SKIPped as parked although the owner had just released it. Read-modify-write: the
+    on-disk file keeps winning for every key we are not deliberately updating.
+    """
     try:
+        disk = load_policy()
+        park = disk["park"]
+        for k, v in POLICY_DIRTY.items():
+            park[k] = v
+        POLICY_CACHE["accept"], POLICY_CACHE["park"] = disk["accept"], park
         with open(POLICY, "w", encoding="utf-8") as fh:
-            json.dump({"accept": sorted(p["accept"]), "park": p["park"]}, fh,
+            json.dump({"accept": sorted(disk["accept"]), "park": park}, fh,
                       ensure_ascii=False, indent=1)
     except OSError as e:
         log("   ! could not save %s: %s" % (POLICY, e))
 
 
 POLICY_CACHE = load_policy()
+POLICY_DIRTY = {}      # disp key -> rounds, ONLY for counters this process incremented
 
 
 def probe(p, tries=3):
@@ -1248,6 +1262,7 @@ def main():
                     # is persisted: without it every pass re-encoded the same eight items forever.
                     k = disp(f)
                     POLICY_CACHE["park"][k] = POLICY_CACHE["park"].get(k, 0) + 1
+                    POLICY_DIRTY[k] = POLICY_CACHE["park"][k]
                     save_policy(POLICY_CACHE)
                     log("   -> quality round %d/%d failed for this item%s"
                         % (POLICY_CACHE["park"][k], PARK_AFTER,

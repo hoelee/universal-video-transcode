@@ -38,6 +38,11 @@ import transcode as T  # noqa: E402
 
 FFMPEG = T.FFMPEG
 FFPROBE = T.FFPROBE
+# A console-less parent (the queues run the engines under pythonw.exe) makes every console-subsystem
+# child - ffmpeg, ffprobe - allocate a NEW console and SHOW it: measured 2026-10-11, one visible
+# Windows Terminal window per spawned child while two encodes ran. CREATE_NO_WINDOW suppresses that
+# (0 on POSIX, where the flag does not exist).
+NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 ROOT = r"Z:\Class\樊登读书\樊登读书会（每周更新）"
 WORK = r"C:\AI\transcode-run"
 STAGE = os.path.join(WORK, "stage")
@@ -197,6 +202,7 @@ def probe(p, tries=3):
 
 
 def run(cmd, timeout=86400, **kw):
+    kw.setdefault("creationflags", NOWIN)      # never a visible console per call
     return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                           errors="replace", timeout=timeout, **kw)
 
@@ -223,7 +229,7 @@ def run_watched(cmd, watch, stall_s=STALL_S, timeout=86400):
     errf = watch + ".err"
     err = ""
     with open(errf, "wb") as ferr:
-        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=ferr)
+        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=ferr, creationflags=NOWIN)
         last, last_t, t0 = -1, time.time(), time.time()
         while p.poll() is None:
             time.sleep(30)
@@ -538,7 +544,8 @@ def ssim_vs_source(src_local, out_local, info, workdir, tag, dur=SSIM_WINDOW):
         subprocess.run([FFMPEG, "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", cmp_scale,
                         "-i", ref, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", cmp_scale, "-i", out,
                         "-lavfi", "ssim=stats_file=ssim_%s.log" % tag, "-f", "null", "-"],
-                       capture_output=True, cwd=workdir, timeout=900)
+                       capture_output=True, cwd=workdir, timeout=900,
+                       creationflags=NOWIN)
     except subprocess.TimeoutExpired:
         # A wedged ffmpeg must not hang the item forever: without this the lane would sit on a dead
         # filtergraph until a human noticed (measured outside the engine 2026-10-11: a stalled
@@ -674,7 +681,8 @@ def _ssim_series(ref_raw, out_raw, off, nf, workdir, tag):
         subprocess.run([FFMPEG, "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", "480:270",
                         "-i", pa, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", "480:270", "-i", pb,
                         "-lavfi", "ssim=stats_file=%s" % os.path.basename(log), "-f", "null", "-"],
-                       capture_output=True, cwd=workdir, timeout=900)
+                       capture_output=True, cwd=workdir, timeout=900,
+                       creationflags=NOWIN)
     except subprocess.TimeoutExpired:
         # one offset that cannot be scored is data we do not have - never a hang and never a verdict
         log("   ! pair ssim at off %+d timed out after 900 s - skipping this offset" % off)
@@ -724,7 +732,8 @@ def vmaf_of_pair(ref_raw, out_raw, off, nf, workdir, tag):
         _copy_frames(out_raw, pb, max(0, -off), k, fs)
         subprocess.run([FFMPEG, "-y", "-v", "error"] + raw + ["-i", pb] + raw + ["-i", pa,
                         "-lavfi", "libvmaf=log_path=%s:log_fmt=json" % os.path.basename(log),
-                        "-f", "null", "-"], capture_output=True, cwd=workdir, timeout=900)
+                        "-f", "null", "-"], capture_output=True, cwd=workdir, timeout=900,
+                       creationflags=NOWIN)
         with open(log, encoding="utf-8", errors="replace") as fh:
             m = json.load(fh)["pooled_metrics"]["vmaf"]
         return {"mean": float(m["mean"]), "min": float(m["min"]), "frames": k}

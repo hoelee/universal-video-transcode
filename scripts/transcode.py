@@ -47,9 +47,16 @@ def log(*a):
     print(time.strftime("%H:%M:%S ") + " ".join(str(x) for x in a), flush=True)
 
 
+# A console-less parent (the queues run the engines under pythonw.exe) makes every console-subsystem
+# child - ffmpeg, ffprobe - allocate a NEW console and SHOW it: measured 2026-10-11, one visible
+# Windows Terminal window per spawned child while two encodes ran. CREATE_NO_WINDOW suppresses that
+# (0 on POSIX, where the flag does not exist).
+NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 def run(cmd, timeout=86400):
     return subprocess.run(cmd, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=timeout)
+                          encoding="utf-8", errors="replace", timeout=timeout,
+                          creationflags=NOWIN)
 
 
 def _fps(v):

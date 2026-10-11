@@ -39,7 +39,9 @@ python cache/vmaf_native.py --original <快照原档> --converted <线上档> --
 ⚠ 比较 mean 必须同帧数：偏移搜索上限 1200 帧 —— 同一配对 1500 帧读 0.9808、1200 帧读 0.9832。
 ⚠ 原生 ffmpeg/ffprobe 读不了 CJK 路径（`Illegal byte sequence`），复核线上档要用 Python `subprocess` 传路径。
 
-**现在两档都停着**（业主 2026-10-11：先把程序收尾）。恢复由队列仓的看板/lane 控制，不在引擎侧；本仓不要自己起编码。
+**现在由队列仓控制**（`D:\dev\hoelee-resource-transcode`：supervisor 看板 8790 + 三 lane）。2026-10-11 13:35 业主恢复转换，
+cpu + gpu 两条 lane 在跑（`autostart_lanes=[cpu,gpu]`）。**本仓不要自己起编码** —— 引擎只作为 lane 的子进程被调用，
+单档启动器（`run/relaunch_x265.sh` 等）只在看板不参与时应急用。
 
 ## 现在在跑什么
 
@@ -225,6 +227,38 @@ per-item 兜底；删半截 `remote_tmp` 的清理写在 `except OSError` 里 �
   0807东京传、0527 洪业、» 0819 李白、1230 不安的哲学。**它们对应的 live 原档一个没动**，下一轮自动重做。
 - 共享盘上 `*.new.mp4` 现在 **0 个**。
 | 0622人生海海 / » 0819 李白 / 0527 洪业 / 0807东京传 / 20190601被管教的勇气 / 1230 不安的哲学 / 0511原生家庭 | 8 MB–165 MB | ❌ 半截，删 |
+
+## 第 12 个 bug：解除 park 被"正在跑的引擎"改回去（2026-10-11）
+
+现象：13:47 解除了 `0705机械宇宙` 的 park 条目（业主"降参数"决定），13:59 这一项还是被 **SKIP parked: 2 rounds**，
+而且 `0808 陌生人效应` 的条目莫名出现。
+
+根因：`save_policy()` 把**内存里的整份快照**写回文件。13:35 起跑的那个引擎进程在 13:35 读的 policy 里
+`机械宇宙` 还是 2；它自己的项在 13:5x 失败时就把快照整份写回 → 外部刚删掉的条目复活（并顺手写入自己的 1）。
+
+修（`scripts/library_run.py`）：`save_policy` 改成**读-改-写**——先重新读盘，再只覆盖本进程真正 +1 的计数
+（`POLICY_DIRTY`），`accept` 一律以盘上为准。回归：`scripts/test_policy_merge.py`（4 项：放行项保持放行 / 外部新增
+accept 保住 / 计数落盘 / 旧行为确实会把它复活）。
+
+⚠ 顺序仍然重要：**解除 park 前先 `pause-after` 把 lane 停到 item 边界**，别指望"改得够快"。
+
+## 第 11 个 bug：pythonw 下每个 ffmpeg/ffprobe 子进程弹一个终端窗口（2026-10-11）
+
+现象：转换一跑，屏幕时不时冒出一个命令行/终端窗口，一项里出现多次。
+
+根因：队列把引擎（`library_run.py`）以 **`pythonw.exe`** 启动 —— GUI 子系统，**完全没有控制台**。
+Windows 的规则是：控制台子进程若父进程没有控制台，系统就**新建一个控制台并显示出来**。
+所以引擎里每一次 `ffprobe`/`ffmpeg` 调用（probe、编码、闸门的 SSIM/pair/VMAF）都弹一个窗口；
+Win11 默认终端是 Windows Terminal，所以看到的是"终端窗口"（类名 `CASCADIA_HOSTING_WINDOW_CLASS`），不是老式 cmd 窗口。
+
+修（`library_run.py` + `transcode.py`）：每个 `subprocess` 调用都带 `creationflags=CREATE_NO_WINDOW`
+（`transcode.run`、`library_run.run`、`run_watched`、以及三处直接调 ffmpeg 的闸门助手）。
+队列仓的 `scripts/tsconv.py` / `scripts/tsfix.py` 同病同修（各加一个默认带 flag 的 `run()` 包装）。
+
+验证（队列仓 `scripts/nowin_popup_launch.py` → `nowin_popup_test.py`）：必须用**没有控制台的父进程**
+（从 shell 起 pythonw 会继承那个 shell 的控制台 → 假阴性），脚本先断言 `GetConsoleWindow()==0`，
+再数可见的 `ConsoleWindowClass` + `CASCADIA_HOSTING_WINDOW_CLASS`：裸 `Popen` 会多出 1 个窗口，
+带 flag 的（含全部 patched helper）保持 0。实测 2026-10-11：0→1 / 0 / 0 / 0 / 0 / 0。
 
 ## 红线（用户明确要求过）
 

@@ -872,14 +872,45 @@ def _perframe_best(ref_raw, out_raw, nf, workdir, tag):
     return len(s), min(s), sum(s) / len(s)
 
 
-def pin_to_e_cores():
-    """x265 tiers: keep the P-cores free for the desktop (measured 3.51x vs 4.37x realtime)."""
+def pin_to_e_cores(mask=None):
+    """x265 tiers: restrict this process - and every child it spawns, because a process affinity
+    mask is inherited - to the cores the control plane picked. Default = the E-core mask of the
+    physical host (measured there: 3.51x vs 4.37x realtime when the desktop keeps the P-cores).
+
+    The mask is a parameter, not a constant, because the control plane runs on hosts whose core
+    layout differs from the one this constant was measured on (2026-10-12: the Windows VM has 26
+    logical CPUs and 0x3FF0000 = CPUs 16-25 is 10 of them, i.e. 16 vCPUs were idle), and because
+    the dashboard's per-core checkboxes have to reach the encoder. `--pools` must be kept in step
+    with the mask by the caller: x265 will not use more threads than it is given.
+    """
+    m = E_CORE_MASK if mask in (None, "") else int(mask)
     try:
-        ctypes.windll.kernel32.SetProcessAffinityMask(
-            ctypes.windll.kernel32.GetCurrentProcess(), ctypes.c_size_t(E_CORE_MASK))
-        return True
-    except Exception:
+        k32 = ctypes.windll.kernel32
+        # GetCurrentProcess() returns the PSEUDO-handle -1 (0xFFFFFFFFFFFFFFFF). With no declared
+        # restype ctypes truncates it to a 32-bit int, SetProcessAffinityMask fails with
+        # ERROR_INVALID_HANDLE (6), and because the old code never inspected the return value it
+        # logged "E-core pinning: on" while applying NOTHING. Verified 2026-10-12 by reading the
+        # mask back: the process stayed at 0x3FFFFFF (all 26 CPUs). Declare the prototype.
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        k32.SetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        k32.SetProcessAffinityMask.restype = ctypes.c_int
+        return bool(k32.SetProcessAffinityMask(k32.GetCurrentProcess(), ctypes.c_size_t(m)))
+    except Exception:                                                   # noqa: BLE001
         return False
+
+
+def affinity_mask() -> int:
+    """The mask this process is actually restricted to (0 when it cannot be read)."""
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        k32.GetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
+                                               ctypes.POINTER(ctypes.c_size_t)]
+        p, s = ctypes.c_size_t(0), ctypes.c_size_t(0)
+        k32.GetProcessAffinityMask(k32.GetCurrentProcess(), ctypes.byref(p), ctypes.byref(s))
+        return int(p.value)
+    except Exception:                                                   # noqa: BLE001
+        return 0
 
 
 def encode(src_local, dst_local, info, args, tier, vbps, q_off=0):
@@ -1086,17 +1117,27 @@ def process(src, args, dest=None, origin=None):
                     mean_min = SSIM_MEAN_MIN_FALLBACK
                 systematic = bad_share > MAX_BAD_SHARE or (
                     mean is not None and mean < mean_min)
+                # Name the criterion that ACTUALLY failed, at the bar that applied to this item.
+                # Both tests used to print the same "mean X < bar Y" template, so a frame-share
+                # refusal was reported as a mean one - and "mean 0.9972 < bar 0.995" was written into
+                # the ledgers and then read as fact (measured 2026-10-12 on 0912 洞见: 20 of 1199
+                # frames below 0.85 at a healthy mean, refused by the SHARE test). The distinction
+                # decides the fix: a mean shortfall answers to a higher CRF, a frame-share defect
+                # does not, so a wrong label sends the owner to the wrong knob.
+                why = ""
+                if mean is not None and mean < mean_min:
+                    why = "mean %.4f < bar %.3f" % (mean, mean_min)
+                if bad_share > MAX_BAD_SHARE:
+                    why += "%s%.2f%% of frames below %.2f (%d of %d)" % (
+                        ", " if why else "", 100.0 * bad_share, BAD_FRAME_SSIM,
+                        sstat.get("below", 0), nfr)
                 if systematic:
                     if q_off < QUALITY_STEPS and (attempt == 1):
                         q_off = QUALITY_STEPS
-                        log("   quality gate: mean %.4f < bar %.3f, %d of %d frames below %.2f "
-                            "(%.2f%%) - retrying at quality+%d" % (
-                                mean, mean_min, sstat.get("below", 0), nfr,
-                                BAD_FRAME_SSIM, 100.0 * bad_share, q_off))
+                        log("   quality gate: %s - retrying at quality+%d" % (why, q_off))
                         continue
-                    return ("FAIL quality: %s - systematic: mean %.4f < bar %.3f, %.2f%% of frames "
-                            "below %.2f%s"
-                            % (ssim_note, mean, mean_min, 100.0 * bad_share, BAD_FRAME_SSIM,
+                    return ("FAIL quality: %s - systematic: %s%s"
+                            % (ssim_note, why,
                                " (re-do of an already playable file)" if redo_playable else "")), None
                 if lo is not None and lo < SSIM_TARGET:
                     log("   %d scattered frame(s) below %.2f (%.2f%% of the window) with a healthy "
@@ -1198,12 +1239,19 @@ def collect(root):
 
 
 def main():
-    global DECODE_CHECK
+    global DECODE_CHECK, STAGE
     ap = argparse.ArgumentParser()
     ap.add_argument("--cq", type=int, default=CQ_NVENC, help="nvenc tier quality (measured default 30)")
     ap.add_argument("--crf", type=int, default=CRF_X265, help="x265 tier quality (measured default 24)")
     ap.add_argument("--x265-preset", default=X265_PRESET)
-    ap.add_argument("--pools", type=int, default=X265_POOLS, help="x265 threads (match the E-core mask)")
+    ap.add_argument("--pools", type=int, default=X265_POOLS, help="x265 threads (match the affinity mask)")
+    ap.add_argument("--affinity-mask", default="0x%X" % E_CORE_MASK,
+                    help="hex CPU mask for the x265 tier (default = the E-core mask); the mask is "
+                         "inherited by the ffmpeg children and must agree with --pools")
+    ap.add_argument("--stage-dir", default=None,
+                    help="scratch directory for this run (default %s). The ledger, the locks and "
+                         "the policy file stay in WORK - only the disposable per-item scratch "
+                         "moves, so the dashboard can point it at a roomier drive." % STAGE)
     ap.add_argument("--tier", choices=["copy", "nvenc", "x265"],
                     help="only touch files classified into this tier (run tiers separately)")
     ap.add_argument("--force-tier", choices=["copy", "nvenc", "x265"], default=None,
@@ -1238,6 +1286,9 @@ def main():
                          "THROW THE OUTPUT AWAY - nothing is uploaded and nothing is replaced")
     args = ap.parse_args()
     DECODE_CHECK = not args.no_decode_check
+    if args.stage_dir:
+        STAGE = os.path.abspath(args.stage_dir)
+        log("=== stage dir: %s (ledger + locks stay in %s)" % (STAGE, WORK))
 
     os.makedirs(STAGE, exist_ok=True)
     swept = sweep_stage()
@@ -1257,8 +1308,12 @@ def main():
     if args.limit:
         files = files[:args.limit]
     if args.tier == "x265":
-        # x265 is CPU: pin it to the E-cores so the P-cores stay free (children inherit the mask).
-        log("=== E-core pinning: %s" % ("on" if pin_to_e_cores() else "FAILED (running unpinned)"))
+        # x265 is CPU: pin it to the cores the control plane chose so the desktop keeps the rest
+        # (children inherit the mask). Default = the E-core mask of the host this was measured on.
+        mask = int(str(args.affinity_mask), 0)
+        pinned = pin_to_e_cores(mask)
+        log("=== affinity pinning: mask=0x%X pools=%d -> %s (read back 0x%X)" % (
+            mask, args.pools, "on" if pinned else "FAILED (running unpinned)", affinity_mask()))
     # One lock PER TIER, not one global lock: the copy tier uses no encoder, the x265 tier is CPU
     # and the nvenc tier is the GPU ASIC, so they are safe to run side by side whereas two runs of
     # the same tier would race on dst and starve a shared unit.

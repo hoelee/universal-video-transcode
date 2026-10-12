@@ -260,6 +260,23 @@ Win11 默认终端是 Windows Terminal，所以看到的是"终端窗口"（类�
 再数可见的 `ConsoleWindowClass` + `CASCADIA_HOSTING_WINDOW_CLASS`：裸 `Popen` 会多出 1 个窗口，
 带 flag 的（含全部 patched helper）保持 0。实测 2026-10-11：0→1 / 0 / 0 / 0 / 0 / 0。
 
+## 第 13 个 bug：闸门 raw 没人收，暂存目录越堆越满（2026-10-12）
+
+现象：`C:\AI\transcode-run\stage` 里积了 6 个 291 MB 的 `ssim_<pid>_<tag>_{ref,out}.yuv` + 123 个 `ssim_<tag>.log`。
+正常收尾只删 `<tag>_src`/`_out.mp4`，**闸门的 raw / pair / vmaf / stats 日志没人删**；被暂停、重启、看门狗杀掉的项
+留下的文件更是永远没人收。加上项目历史遗留的 45 GB 测量垃圾（`C:/AI/transcode-run/*` 与 `D:/tmp/*`），
+work 盘只剩 3.9 GB → 队列守卫拒绝所有新项，两条 lane 空转 30+ 分钟。
+
+修：
+1. `process()` 的 `finally` 加 `purge_item_artifacts(tag)` —— 按 tag（stage hash）与 pid 删本项的 `ssim_/pair_/vmaf_` 产物，
+   另一条 lane 的文件名字里没有这些 key，绝不会误删。
+2. 新增 `sweep_stage()`，每次启动扫一遍 stage：只删老于 `STAGE_MAX_AGE_H`(6 h，`RT_STAGE_MAX_AGE_H` 可覆盖) 的残留，
+   并且**整条 tag 跳过**（只要有新鲜的 `<tag>_out.mp4.err` = 那一项正在编码）。
+3. 队列侧 `rt/janitor.py`（supervisor 每 30 分钟 + **守卫失败时立刻**清一次再复检）用同一套规则把 stage 和
+   `cache/runs/*.log` 收干净；`ledger*`/`*.lock`/`tsconv_state*`/`queue.sqlite*` 永不碰。
+
+回归：`scripts/test_stage_cleanup.py` 6 项（另一 lane 不动 / 死残留删 / 在编 tag 保全 / 台账不动 / 字节数正确）。
+
 ## 红线（用户明确要求过）
 
 - **绝不删除/覆盖快照原档**（`#snapshot` 是唯一的干净档案）。

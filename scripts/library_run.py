@@ -160,6 +160,84 @@ def disp(p):
 POLICY = os.path.join(WORK, "gate_policy.json")
 PARK_AFTER = 2
 
+# A leftover in the stage dir older than this was left by a run that died (pause, reboot, the stall
+# watchdog, a crash): reclaim it. Measured 2026-10-12: 6 x 291 MB SSIM windows + 123 gate logs had
+# piled up, and the work drive got full enough that the guards refused every new item.
+STAGE_MAX_AGE_H = float(os.environ.get("RT_STAGE_MAX_AGE_H", "6"))
+
+
+def purge_item_artifacts(tag, workdir=None):
+    """Delete THIS item's gate artefacts (window raws, per-offset pairs, VMAF pairs, stats logs).
+
+    Names carry the item tag (the stage hash) or this process's pid, so a lane running at the same
+    time - it shares the stage dir - can never match. Called from process()'s finally, so a clean
+    item leaves nothing behind even before the supervisor's janitor looks.
+    """
+    workdir = workdir or STAGE
+    keys = (tag, str(os.getpid()))
+    removed = 0
+    try:
+        names = os.listdir(workdir)
+    except OSError:
+        return 0
+    for name in names:
+        if not name.startswith(("ssim_", "pair_", "vmaf_")):
+            continue
+        if not any(k and k in name for k in keys):
+            continue
+        try:
+            os.remove(os.path.join(workdir, name))
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def sweep_stage(workdir=None, max_age_h=None):
+    """Reclaim stage files left by runs that died. Never touches a tag that is encoding right now.
+
+    A live item is recognised by ITS OWN progress file (`<tag>_out.mp4.err`, rewritten every 0.5 s by
+    ffmpeg and removed when the encode ends), so an in-flight tag is skipped wholesale.
+    """
+    workdir = workdir or STAGE
+    max_age_h = STAGE_MAX_AGE_H if max_age_h is None else max_age_h
+    if not os.path.isdir(workdir):
+        return {"files": 0, "bytes": 0}
+    now = time.time()
+    cutoff = now - max_age_h * 3600
+    try:
+        entries = os.listdir(workdir)
+    except OSError:
+        return {"files": 0, "bytes": 0}
+    live_tags = set()
+    for name in entries:
+        if name.endswith(".err"):
+            try:
+                if now - os.path.getmtime(os.path.join(workdir, name)) < max_age_h * 3600:
+                    live_tags.add(name.split("_")[0])
+            except OSError:
+                pass
+    files = size = 0
+    for name in entries:
+        p = os.path.join(workdir, name)
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        if not os.path.isfile(p):
+            continue
+        if not (name.startswith(("ssim_", "pair_", "vmaf_")) or "_src." in name or "_out." in name):
+            continue
+        if st.st_mtime >= cutoff or any(t and t in name for t in live_tags):
+            continue
+        try:
+            os.remove(p)
+            files += 1
+            size += st.st_size
+        except OSError:
+            pass
+    return {"files": files, "bytes": size}
+
 
 def load_policy():
     """{"accept": set(disp keys), "park": {disp key: failed rounds}} - missing file means neither."""
@@ -1104,6 +1182,9 @@ def process(src, args, dest=None, origin=None):
                     os.remove(p)
             except OSError:
                 pass
+        # ... and the gate's own artefacts (window raws, pairs, VMAF, stats logs): they are named
+        # with this item's tag or this pid, and leaving them behind is what filled the stage dir.
+        purge_item_artifacts(tag)
 
 
 def collect(root):
@@ -1159,6 +1240,9 @@ def main():
     DECODE_CHECK = not args.no_decode_check
 
     os.makedirs(STAGE, exist_ok=True)
+    swept = sweep_stage()
+    if swept["files"]:
+        log("   stage sweep: reclaimed %d dead file(s), %.0f MB" % (swept["files"], swept["bytes"] / 1e6))
     if args.path:
         files = [args.path]
         if not os.path.exists(args.path):
